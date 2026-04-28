@@ -1,0 +1,36 @@
+# Environment variables
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Node
+node_modules/
+
+# Build artifacts
+frontend/build/
+frontend/dist/
+
+# Exclude all markdown except README.md
+*.md
+!README.md
