@@ -212,6 +212,4 @@ agent_loop = AgentLoop(
 - **Production-Ready**: Error handling, guardrails, and async design throughout
 - **Extensible**: Easy to add new tools and modify behavior
 
-## License
 
-MIT

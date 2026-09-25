@@ -41,8 +41,10 @@ class LLMConfig:
         temperature: float = 0.7,
         max_tokens: int = 1024
     ):
+        if provider not in ("openai", "groq", "gemini"):
+            raise ValueError(f"Unsupported LLM provider: {provider!r}")
         self.provider = provider
-        
+
         # Provider-specific defaults
         if provider == "groq":
             self.base_url = base_url or "https://api.groq.com/openai/v1"
@@ -194,24 +196,13 @@ class LLMClient:
             "Content-Type": "application/json"
         }
         
-        # Debug: print request payload for Groq
-        if self.config.provider == "groq":
-            print(f"Groq request payload: {payload}")
-            print(f"Groq base_url: {self.config.base_url}")
-        
         try:
             response = await self.client.post(
                 f"{self.config.base_url}/chat/completions",
                 json=payload,
                 headers=headers
             )
-            
-            # Debug: print response for Groq
-            if self.config.provider == "groq":
-                print(f"Groq response status: {response.status_code}")
-                if response.status_code != 200:
-                    print(f"Groq response body: {response.text}")
-            
+
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as e:
@@ -293,11 +284,16 @@ class LLMClient:
             }
         }
         
-        # Make API request
-        url = f"{self.config.base_url}/models/{self.config.model}:generateContent?key={self.config.api_key}"
-        
+        # Make API request — the key goes in a header, never in the URL,
+        # so it cannot leak via URLs embedded in logs or error messages.
+        url = f"{self.config.base_url}/models/{self.config.model}:generateContent"
+        headers = {
+            "x-goog-api-key": self.config.api_key,
+            "Content-Type": "application/json",
+        }
+
         try:
-            response = await self.client.post(url, json=payload)
+            response = await self.client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as e:
@@ -368,6 +364,11 @@ class LLMClient:
             - provider: Provider name
             - model: Model name
         """
+        if not self.config.api_key:
+            raise Exception(
+                f"No API key configured for provider '{self.config.provider}'"
+            )
+
         if self.config.provider == "gemini":
             return await self._send_gemini(messages, tool_schemas, json_mode)
         else:

@@ -53,13 +53,11 @@ class AgentLoop:
             AgentState with the final result
         """
         state = AgentState(max_steps=self.max_steps)
-        
-        # Add user message to conversation
-        state.add_message("user", user_message)
-        
-        # Add system prompt
+
+        # Add system prompt first, then the user message
         system_prompt = self._get_system_prompt()
         state.add_message("system", system_prompt)
+        state.add_message("user", user_message)
         
         logger.info(f"Starting agent run {state.run_id}")
         
@@ -274,7 +272,25 @@ class AgentLoop:
             )
             state.add_message("assistant", f"Error: {error_msg}")
             return
-        
+
+        # Enforce tool authorization — registration alone does not grant
+        # execution permission when an allowlist is configured.
+        if self.allowed_tools and tool_name not in self.allowed_tools:
+            error_msg = f"Tool not allowed: {tool_name}"
+            logger.error(error_msg)
+            state.add_trace_entry(
+                entry_type="error",
+                content=error_msg,
+                step_number=state.current_step,
+                tool_name=tool_name,
+                tokens_input=token_metadata.get("prompt_tokens", 0),
+                tokens_output=token_metadata.get("completion_tokens", 0),
+                latency_ms=token_metadata.get("latency_ms", 0),
+                error_details={"stage": "guardrail", "message": error_msg, "recoverable": True}
+            )
+            state.add_message("assistant", f"Error: {error_msg}")
+            return
+
         # Validate arguments against schema
         tool = self.tool_registry.get(tool_name)
         validation = validate_tool_inputs(arguments, tool.input_schema)
@@ -394,8 +410,21 @@ class AgentLoop:
         state.finish(final_answer)
     
     def _get_system_prompt(self) -> str:
-        """Get the system prompt for the LLM."""
-        return """You are a helpful AI assistant with access to tools. Follow the ReAct pattern:
+        """Get the system prompt for the LLM, built from the tools actually
+        allowed for this run (never advertises tools the caller cannot use)."""
+        import json as _json
+
+        definitions = self.tool_registry.get_all_definitions()
+        if self.allowed_tools:
+            definitions = [d for d in definitions if d["name"] in self.allowed_tools]
+
+        tool_lines = "\n".join(
+            f"- {d['name']}: {d['description']}\n  input_schema: "
+            f"{_json.dumps(d['input_schema'])}"
+            for d in definitions
+        ) or "- (no tools available)"
+
+        return f"""You are a helpful AI assistant with access to tools. Follow the ReAct pattern:
 
 1. Think about what you need to do
 2. If you need information, use a tool
@@ -409,14 +438,11 @@ Your responses must be valid JSON with one of these types:
 - finish: Provide the final answer
 
 Example responses:
-{"type": "thought", "thought": "I need to calculate something"}
-{"type": "action", "tool_name": "Calculator", "arguments": {"operation": "add", "a": 5, "b": 3}}
-{"type": "finish", "final_answer": "The answer is 8"}
+{{"type": "thought", "thought": "I need to calculate something"}}
+{{"type": "action", "tool_name": "Calculator", "arguments": {{"operation": "add", "a": 5, "b": 3}}}}
+{{"type": "finish", "final_answer": "The answer is 8"}}
 
 Available tools:
-- Calculator: Perform arithmetic operations
-- WebSearch: Search the web for information
-- FileReader: Read text files from the local filesystem
-- PythonExec: Execute Python code
+{tool_lines}
 
 Always return valid JSON. Think step by step."""

@@ -1,0 +1,10 @@
+# Runtime deps
+-r requirements.txt
+
+# Missing runtime dep used by main.py (load_dotenv)
+python-dotenv>=1.0.0
+
+# Test deps
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=5.0.0

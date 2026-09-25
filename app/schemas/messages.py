@@ -51,10 +51,10 @@ class TraceEntry(BaseModel):
 
 class ChatRequest(BaseModel):
     """Request body for the /chat endpoint."""
-    message: str = Field(..., description="User message")
-    max_steps: int = Field(default=10, description="Maximum number of agent steps")
-    allowed_tools: Optional[list[str]] = Field(None, description="List of allowed tools (empty = all tools)")
-    max_token_budget: Optional[int] = Field(None, description="Maximum token budget for the run")
+    message: str = Field(..., min_length=1, max_length=20_000, description="User message")
+    max_steps: int = Field(default=10, ge=1, le=50, description="Maximum number of agent steps")
+    allowed_tools: Optional[list[str]] = Field(None, max_length=20, description="List of allowed tools (empty = all tools)")
+    max_token_budget: Optional[int] = Field(None, ge=1, le=2_000_000, description="Maximum token budget for the run")
 
 
 class ChatResponse(BaseModel):
