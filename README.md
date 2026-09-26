@@ -1,17 +1,20 @@
 # ReAct Agent Framework
 
-A production-quality minimal ReAct agent framework built from scratch in Python. Implements the Thought → Action → Observation loop with tool calling, guardrails, and real-time streaming.
+A minimal ReAct agent framework built from scratch in Python — no LangChain, LlamaIndex, or other agent frameworks. Implements the Thought → Action → Observation loop with validated tool calling, guardrails, full execution traces, and replay.
 
 ## Features
 
-- **ReAct Pattern**: Full implementation of Thought → Action → Observation loop
-- **Tool System**: Modular tool registry with JSON Schema validation
-- **Guardrails**: Loop detection, step limits, and timeout protection
-- **Trace Logging**: Complete execution trace with timestamps and token usage
-- **SSE Streaming**: Real-time streaming of agent execution
+- **ReAct Pattern**: Thought → Action → Observation loop with explicit state machine and termination reasons
+- **Tool System**: Registry with JSON Schema argument validation, per-run `allowed_tools` authorization, and execution timeouts
+- **Guardrails**: Repeated-tool-call and repeated-thought detection, step limits, token budgets
+- **Trace Logging**: Complete execution trace with timestamps, latency, and token usage
+- **Replay**: Re-run analysis of completed executions with latency statistics
+- **SSE Streaming**: Replays a completed run's trace as Server-Sent Events
+- **Structured Errors**: Typed error entries (`tool_execution`, `parsing`, `llm`, `guardrail`, `timeout`) that don't corrupt agent state
 - **Async Design**: Fully async/await throughout
 - **Type Safety**: Pydantic v2 models with full type hints
-- **FastAPI Backend**: RESTful API with health checks
+
+See `AGENT_LOOP.md` for the state-machine diagram, transition invariants, and termination semantics.
 
 ## Project Structure
 
@@ -19,197 +22,171 @@ A production-quality minimal ReAct agent framework built from scratch in Python.
 /app
   /agent
     loop.py          # Core ReAct agent loop
-    parser.py        # LLM response parser
-    state.py         # Agent state management
-    guardrails.py    # Safety checks and loop detection
+    parser.py        # LLM response parser (strict JSON + repair)
+    state.py         # Agent state, trace entries, termination reasons
+    guardrails.py    # Step limits, loop detection, timeouts
+    memory.py        # Conversation memory
+    replay.py        # Run replay and analysis
   /tools
     base.py          # Base tool class
     registry.py      # Tool registry
     calculator.py    # Calculator tool
     web_search.py    # Web search tool (mock)
-    file_reader.py   # File reader tool
-    python_exec.py   # Python code executor
+    file_reader.py   # File reader (workspace-jailed)
+    python_exec.py   # Python executor (disabled by default)
   /api
     routes.py        # FastAPI routes
     sse.py           # Server-Sent Events streaming
   /schemas
     messages.py      # Message and response schemas
     tools.py         # Tool validation schemas
-  /utils
-    logger.py        # Logging utilities
-    hashing.py       # Hashing for loop detection
-llm.py              # LLM client wrapper
-main.py             # Application entry point
+  llm.py             # Multi-provider LLM client (OpenAI/Groq/Gemini)
+  storage.py         # In-memory run store
+main.py              # FastAPI app entry point
+/frontend            # React 18 + Vite + TailwindCSS UI
+/tests               # pytest suite (~210 tests)
 ```
 
 ## Installation
 
-1. Install dependencies:
 ```bash
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # for running tests
 ```
 
-2. Set environment variables:
+## Configuration
+
+All configuration is via environment variables (loaded from `.env`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `openai` | `openai`, `groq`, or `gemini` |
+| `OPENAI_API_KEY` | — | Required when provider is `openai` |
+| `GROQ_API_KEY` | — | Required when provider is `groq` |
+| `GEMINI_API_KEY` | — | Required when provider is `gemini` |
+| `AGENTLOOP_API_KEY` | unset | If set, all endpoints except `/` and `/api/health` require the `X-API-Key` header |
+| `AGENTLOOP_ENABLE_PYTHON_EXEC` | unset | Set to `1` to enable the PythonExec tool (see Security Notes) |
+| `CORS_ORIGINS` | `localhost:3000` origins | Comma-separated allowed origins |
+| `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
+
+Defaults per provider: OpenAI `gpt-4`, Groq `llama-3.1-8b-instant`, Gemini `gemini-pro`.
+
+## Running
+
+Backend:
+
 ```bash
-export OPENAI_API_KEY="your-api-key"
+python main.py    # http://127.0.0.1:8000
 ```
 
-## Running the Server
+Frontend:
 
-Start the FastAPI server:
 ```bash
-python main.py
+cd frontend && npm install && npm run dev
 ```
-
-The server will start on `http://localhost:8000`
 
 ## API Endpoints
 
 ### POST /api/chat
+
 Process a user message through the agent loop.
 
 **Request:**
 ```json
 {
   "message": "What is 15 * 7?",
-  "max_steps": 10
+  "max_steps": 10,
+  "allowed_tools": ["Calculator"],
+  "max_token_budget": 50000
 }
 ```
+
+- `message` (required): 1–20,000 chars
+- `max_steps`: 1–50, default 10
+- `allowed_tools`: optional whitelist; omit to allow all registered tools
+- `max_token_budget`: optional cap; run terminates with `budget_exceeded` when exceeded
 
 **Response:**
 ```json
 {
   "run_id": "uuid-here",
   "final_answer": "The answer is 105",
-  "steps": 2
+  "steps": 2,
+  "total_tokens": 842,
+  "total_cost": 0.012,
+  "error": null,
+  "termination_reason": "completed"
 }
 ```
+
+`termination_reason` is one of `completed`, `error`, `max_steps`, `budget_exceeded`, `loop_detected`.
 
 ### GET /api/trace/{run_id}
-Get the full execution trace for a run.
 
-**Response:**
-```json
-{
-  "run_id": "uuid-here",
-  "conversation_history": [...],
-  "trace": [
-    {
-      "type": "thought",
-      "content": "I need to calculate 15 * 7",
-      "timestamp": "2024-01-01T00:00:00",
-      "tool_name": null
-    },
-    {
-      "type": "action",
-      "content": "Calling Calculator",
-      "tool_name": "Calculator",
-      "timestamp": "2024-01-01T00:00:01"
-    },
-    {
-      "type": "observation",
-      "content": "{\"result\": 105}",
-      "tool_name": "Calculator",
-      "timestamp": "2024-01-01T00:00:01",
-      "execution_time": 0.05
-    }
-  ],
-  "current_step": 2,
-  "is_finished": true
-}
-```
+Full execution trace for a run: conversation history, trace entries (thought/action/observation/error), step count, token usage, termination reason. Returns 404 for unknown run IDs.
 
-### GET /api/stream
-Stream agent execution in real-time using Server-Sent Events.
+### GET /api/replay/{run_id}
 
-**Query Parameters:**
-- `message`: User message to process
-- `max_steps`: Maximum steps (default: 10)
+Replays a stored run's trace. Returns `success`, `steps`, `final_answer`, `error`.
 
-**Events:**
-```json
-{"type": "thought", "content": "...", "step": 1}
-{"type": "action", "content": "...", "tool_name": "...", "step": 2}
-{"type": "observation", "content": "...", "tool_name": "...", "step": 2}
-{"type": "final", "final_answer": "...", "steps": 2}
-```
+### GET /api/replay/{run_id}/analysis
+
+Replay plus analysis: per-step latency stats, tool-call counts, trace data, termination reason.
+
+### GET /api/stream/{run_id}
+
+Streams a **completed** run's trace as Server-Sent Events (step, tool_call, metrics, finish). This replays stored results — it is not live execution streaming.
 
 ### GET /api/health
-Health check endpoint.
+
+Health check. Always open, even when `AGENTLOOP_API_KEY` is set.
 
 ## Available Tools
 
-1. **Calculator**: Perform basic arithmetic (add, subtract, multiply, divide)
-2. **WebSearch**: Search the web (mock implementation)
-3. **FileReader**: Read text files from the local filesystem
-4. **PythonExec**: Execute Python code in a sandboxed environment
+1. **Calculator**: Basic arithmetic (add, subtract, multiply, divide)
+2. **WebSearch**: Web search (mock implementation)
+3. **FileReader**: Reads text files, jailed to a workspace root — blocks `..` traversal, absolute-path escapes, symlinks, hidden files (`.env`, `.git`), and files over 1 MB
+4. **PythonExec**: Executes whitelisted Python expressions. **Disabled by default** — set `AGENTLOOP_ENABLE_PYTHON_EXEC=1` to enable. See Security Notes before enabling.
 
 ## Example Usage
 
-### Using curl
-
 ```bash
-# Chat endpoint
+# Chat
 curl -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Calculate 25 * 4", "max_steps": 10}'
 
-# Stream endpoint
-curl "http://localhost:8000/api/stream?message=Calculate%2025%20*%204&max_steps=10"
+# Stream the completed run's trace
+curl http://localhost:8000/api/stream/<run_id>
+
+# With API key auth enabled
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"message": "Hello"}'
 ```
 
-### Using Python
+## Testing
 
-```python
-import httpx
-
-async def chat(message: str):
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "http://localhost:8000/api/chat",
-            json={"message": message, "max_steps": 10}
-        )
-        return response.json()
-
-result = await chat("What is 100 / 5?")
-print(result)
+```bash
+python -m pytest tests/ -q                                              # full suite
+python -m pytest tests/ -q --cov=app --cov=main --cov-report=term-missing # with coverage
+python -m pytest tests/test_security.py -q                              # security tests only
 ```
 
-## Configuration
+The suite (~210 tests, ~92% coverage) uses a scripted mock LLM and mocked httpx — it never calls real LLM APIs. Covers parser, tools/registry, guardrails, agent loop, API/SSE/replay, provider-specific message assembly, and security regressions.
 
-### LLM Configuration
+## Security Notes
 
-Edit `app/api/routes.py` to configure the LLM client:
-
-```python
-def get_llm_client() -> LLMClient:
-    return LLMClient(
-        api_key="your-key",
-        base_url="https://api.openai.com/v1",
-        model="gpt-4",
-        temperature=0.7
-    )
-```
-
-### Guardrails Configuration
-
-Configure guardrails in `app/agent/loop.py`:
-
-```python
-agent_loop = AgentLoop(
-    llm_client=llm_client,
-    tool_registry=tool_registry,
-    max_steps=10,        # Maximum agent steps
-    tool_timeout=30      # Tool execution timeout (seconds)
-)
-```
+- **PythonExec is not a sandbox.** Even with its AST whitelist, it runs in-process. Keep it disabled for untrusted input; move execution to a subprocess/container if you need real isolation.
+- **FileReader** is jailed to its workspace but prompt injection can steer reads anywhere *inside* it.
+- **Auth is opt-in** — without `AGENTLOOP_API_KEY`, trace/replay endpoints expose full run contents to anyone with a run_id.
+- **Run storage is unbounded in-memory** — restarts clear it; there's no persistence or eviction.
+- CORS uses an explicit origin allowlist with credentials disabled; `max_steps` and message length are bounded at the schema level.
 
 ## Design Principles
 
-- **No Frameworks**: Built without LangChain, LlamaIndex, or similar frameworks
+- **No Frameworks**: Built without LangChain, LlamaIndex, or similar
 - **Modular**: Clean separation of concerns with minimal coupling
-- **Debuggable**: Full trace logging for every execution step
-- **Production-Ready**: Error handling, guardrails, and async design throughout
-- **Extensible**: Easy to add new tools and modify behavior
-
-
+- **Debuggable**: Full trace logging and replayable runs
+- **Extensible**: Register new tools via `ToolRegistry` with a JSON Schema
