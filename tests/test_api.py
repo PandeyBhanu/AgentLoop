@@ -71,6 +71,8 @@ class TestChat:
         assert data["steps"] == 1
         assert data["run_id"]
         assert data["error"] is None
+        assert data["termination_reason"] == "completed"
+        assert data["total_cost"] is not None
 
     def test_run_stored_for_trace(self, client, mock_llm):
         mock_llm([finish_response("stored")])
@@ -129,6 +131,7 @@ class TestChat:
         data = r.json()
         assert data["error"] is not None
         assert "budget" in data["error"].lower()
+        assert data["termination_reason"] == "budget_exceeded"
 
 
 # ---------------------------------------------------------------------------
@@ -186,13 +189,6 @@ class TestReplay:
         assert data["success"] is False
         assert "not found" in data["error"].lower()
 
-    @pytest.mark.xfail(
-        reason="BUG: replay_with_analysis 500s whenever any trace entry has "
-               "latency_ms — analysis['latency_stats'] is initialized to {} "
-               "(replay.py:109) so the lazy-init 'not in' check at line 135 "
-               "never fires and stats['min'] raises KeyError",
-        strict=False,
-    )
     def test_replay_analysis(self, client, mock_llm):
         mock_llm([
             action_response("Calculator", {"operation": "add", "a": 1, "b": 1}),
@@ -214,12 +210,6 @@ class TestReplay:
         assert r.status_code == 200
         assert "error" in r.json()
 
-    @pytest.mark.xfail(
-        reason="BUG: replay_with_analysis response does not include a 'trace' "
-               "key — frontend ReplayControls reads analysis.trace and gets "
-               "undefined, crashing the replay UI",
-        strict=False,
-    )
     def test_replay_analysis_includes_trace(self, client, mock_llm):
         mock_llm([finish_response("x")])
         run_id = run_chat(client).json()["run_id"]

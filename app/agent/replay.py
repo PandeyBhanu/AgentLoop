@@ -104,23 +104,35 @@ def replay_with_analysis(run_id: str) -> Dict[str, Any]:
         "steps_by_type": {},
         "total_tokens": run_data.get("total_tokens", 0),
         "total_cost": run_data.get("total_cost", 0.0),
+        "termination_reason": run_data.get("termination_reason"),
         "errors": [],
         "tool_calls": [],
-        "latency_stats": {}
+        "latency_stats": {},
+        "trace": trace,  # the frontend ReplayControls consumes this
     }
-    
+
+    # Collect latencies first so stats are computed once.
+    latencies = [e.get("latency_ms") for e in trace if e.get("latency_ms")]
+    if latencies:
+        analysis["latency_stats"] = {
+            "min": min(latencies),
+            "max": max(latencies),
+            "count": len(latencies),
+            "avg": sum(latencies) / len(latencies),
+        }
+
     # Count steps by type
     for entry in trace:
         entry_type = entry.get("type")
         analysis["steps_by_type"][entry_type] = analysis["steps_by_type"].get(entry_type, 0) + 1
-        
+
         # Track tool calls
         if entry_type == "action":
             analysis["tool_calls"].append({
                 "tool_name": entry.get("tool_name"),
                 "step": entry.get("step_number")
             })
-        
+
         # Track errors
         if entry_type == "error":
             analysis["errors"].append({
@@ -128,21 +140,6 @@ def replay_with_analysis(run_id: str) -> Dict[str, Any]:
                 "message": entry.get("content"),
                 "recoverable": entry.get("error_details", {}).get("recoverable")
             })
-        
-        # Track latency
-        latency = entry.get("latency_ms")
-        if latency:
-            if "latency_stats" not in analysis:
-                analysis["latency_stats"] = {"min": latency, "max": latency, "total": 0, "count": 0}
-            stats = analysis["latency_stats"]
-            stats["min"] = min(stats["min"], latency)
-            stats["max"] = max(stats["max"], latency)
-            stats["total"] += latency
-            stats["count"] += 1
-    
-    # Calculate average latency
-    if analysis["latency_stats"] and analysis["latency_stats"]["count"] > 0:
-        analysis["latency_stats"]["avg"] = analysis["latency_stats"]["total"] / analysis["latency_stats"]["count"]
     
     # Perform replay
     replay_result = replay(run_id)

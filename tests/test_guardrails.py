@@ -69,12 +69,6 @@ class TestThoughtLoopDetection:
             ok, _ = guardrails.check_thought_loop(f"completely different idea {i}")
             assert ok
 
-    @pytest.mark.xfail(
-        reason="BUG: docstring says 'allows one repeat' but the similarity check "
-               "(>0.9) fires on the first identical repeat since identical "
-               "thoughts score 1.0 — one repeat is never actually allowed",
-        strict=False,
-    )
     def test_single_repeat_allowed(self, guardrails):
         # Documented behavior: first repeat is tolerated to avoid false positives
         assert guardrails.check_thought_loop("same thought")[0]

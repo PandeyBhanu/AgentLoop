@@ -89,13 +89,15 @@ class Guardrails:
         
         for i, historical_thought in enumerate(self.thought_history):
             historical_hash = hashlib.sha256(historical_thought.encode()).hexdigest()
-            
-            # Check for exact match
+
+            # Check for exact match — one repeat is tolerated, a second
+            # identical repeat (3rd occurrence) is a loop.
             if thought_hash == historical_hash:
                 exact_matches += 1
                 if exact_matches >= 2:
                     return False, f"Thought loop detected: identical thought repeated {exact_matches} times"
-            
+                continue  # identical is handled by the counter above
+
             # Check for high similarity (simple check: if they share >90% of words)
             thought_words = set(thought.lower().split())
             historical_words = set(historical_thought.lower().split())

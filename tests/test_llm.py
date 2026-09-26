@@ -141,10 +141,9 @@ class TestGeminiPath:
         content, meta = await client.send_messages(MSGS)
 
         payload = mock.call_args.kwargs["json"]
-        # implementation maps every non-"user" role (incl. system) to "model"
-        assert payload["contents"][0]["role"] == "model"
-        assert payload["contents"][0]["parts"][0]["text"] == "sys"
-        assert payload["contents"][1]["role"] == "user"
+        # system messages are extracted into system_instruction, not contents
+        assert payload["system_instruction"]["parts"][0]["text"] == "sys"
+        assert payload["contents"][0]["role"] == "user"
         assert meta["provider"] == "gemini"
         assert meta["total_tokens"] == 12
 
@@ -162,7 +161,8 @@ class TestGeminiPath:
         mock = patch_post(client, monkeypatch, http_response(payload=GEMINI_PAYLOAD))
         msgs = MSGS + [Message(role="assistant", content="a")]
         await client.send_messages(msgs)
-        assert mock.call_args.kwargs["json"]["contents"][2]["role"] == "model"
+        # system extracted to system_instruction → contents = [user, model]
+        assert mock.call_args.kwargs["json"]["contents"][1]["role"] == "model"
 
 
 # ---------------------------------------------------------------------------

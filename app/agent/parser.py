@@ -96,7 +96,13 @@ class ResponseParser:
                     raise ValueError(f"Failed to extract JSON from code blocks: {extract_error}")
             else:
                 raise ValueError(f"Invalid JSON response: {e}")
-        
+
+        # The response must be a JSON object — lists/scalars crash on .get()
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Response must be a JSON object, got {type(data).__name__}"
+            )
+
         # Validate required fields
         response_type = data.get("type")
         if not response_type:
@@ -109,8 +115,10 @@ class ResponseParser:
         if response_type == "action":
             if not data.get("tool_name"):
                 raise ValueError("Action response missing 'tool_name'")
-            if not data.get("arguments"):
+            if "arguments" not in data:
                 raise ValueError("Action response missing 'arguments'")
+            if not isinstance(data["arguments"], dict):
+                raise ValueError("Action 'arguments' must be a JSON object")
         
         if response_type == "finish":
             if not data.get("final_answer"):
@@ -171,32 +179,21 @@ class ResponseParser:
         # Attempt 1: Strict parse
         try:
             return ResponseParser.parse(response_text), True, ""
-        except ValueError as e:
+        except ValueError:
             pass
-        
-        # Attempt 2: Repair and parse (up to max_retries)
-        for attempt in range(max_retries):
-            try:
-                repaired_text = repair_llm_output(response_text)
-                return ResponseParser.parse(repaired_text), True, ""
-            except ValueError as e:
-                if attempt == max_retries - 1:
-                    # Final attempt failed, return error observation
-                    error_response = LLMResponse(
-                        type="thought",
-                        thought=f"Parsing error: Could not parse LLM response after {max_retries} repair attempts. Original error: {str(e)}",
-                        tool_name=None,
-                        arguments=None,
-                        final_answer=None
-                    )
-                    return error_response, False, f"Parse failed after {max_retries} repair attempts: {str(e)}"
-        
-        # Should not reach here, but return error if we do
-        error_response = LLMResponse(
-            type="thought",
-            thought="Parsing error: Unexpected failure in retry mechanism",
-            tool_name=None,
-            arguments=None,
-            final_answer=None
-        )
-        return error_response, False, "Unexpected parse failure"
+
+        # Attempt 2: deterministic repair. repair_llm_output is pure, so
+        # repeating it on the same input can never change the outcome —
+        # one repair attempt is sufficient; further "retries" were dead code.
+        try:
+            repaired_text = repair_llm_output(response_text)
+            return ResponseParser.parse(repaired_text), True, ""
+        except ValueError as e:
+            error_response = LLMResponse(
+                type="thought",
+                thought=f"Parsing error: Could not parse LLM response after repair. Original error: {str(e)}",
+                tool_name=None,
+                arguments=None,
+                final_answer=None
+            )
+            return error_response, False, f"Parse failed after repair attempt: {str(e)}"

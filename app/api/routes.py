@@ -87,14 +87,18 @@ async def chat(request: ChatRequest) -> ChatResponse:
                 final_answer=f"Error: {state.error}",
                 steps=state.current_step,
                 total_tokens=state.total_tokens,
-                error=state.error
+                total_cost=state.total_cost,
+                error=state.error,
+                termination_reason=state.termination_reason
             )
-        
+
         return ChatResponse(
             run_id=state.run_id,
             final_answer=state.final_answer or "No answer provided",
             steps=state.current_step,
-            total_tokens=state.total_tokens
+            total_tokens=state.total_tokens,
+            total_cost=state.total_cost,
+            termination_reason=state.termination_reason
         )
         
     except Exception as e:

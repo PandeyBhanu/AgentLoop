@@ -63,7 +63,11 @@ class ChatResponse(BaseModel):
     final_answer: Any = Field(..., description="Final answer from the agent")
     steps: int = Field(..., description="Number of steps taken")
     total_tokens: Optional[int] = Field(None, description="Total tokens used")
+    total_cost: Optional[float] = Field(None, description="Total estimated cost in USD")
     error: Optional[str] = Field(None, description="Error message if run failed")
+    termination_reason: Optional[str] = Field(
+        None, description="completed | error | max_steps | budget_exceeded | loop_detected"
+    )
 
 
 class StructuredError(BaseModel):

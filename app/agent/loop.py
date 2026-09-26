@@ -1,7 +1,13 @@
 """
 Agent loop implementing the ReAct pattern: Thought → Action → Observation.
+
+State machine (see AGENT_LOOP.md):
+    running → (per step) llm_response → thought | action | finish
+    action  → validation → tool_execution → observation → next step
+    any step may terminate via finish | error | max_steps | budget | loop
 """
 import asyncio
+import json
 import time
 from typing import Optional, Callable
 from app.agent.state import AgentState
@@ -35,7 +41,6 @@ class AgentLoop:
         self.max_token_budget = max_token_budget
         self.allowed_tools = allowed_tools
         self.guardrails = Guardrails(max_steps=max_steps, tool_timeout=tool_timeout)
-        self.total_tokens_used = 0
     
     async def run(
         self,
@@ -82,15 +87,15 @@ class AgentLoop:
                     max_retries=2
                 )
                 
-                # Track token usage and check budget
+                # Track token usage (single counter on state) and check budget
                 tokens_used = token_metadata.get("total_tokens", 0)
-                self.total_tokens_used += tokens_used
-                state.total_cost += token_metadata.get("estimated_cost", 0)
-                
+                state.record_usage(token_metadata)
+
                 # Check token budget
-                if self.max_token_budget and self.total_tokens_used > self.max_token_budget:
-                    logger.error(f"Token budget exceeded: {self.total_tokens_used} > {self.max_token_budget}")
-                    state.fail(f"Token budget exceeded: {self.total_tokens_used} > {self.max_token_budget}")
+                if self.max_token_budget and state.total_tokens > self.max_token_budget:
+                    error_msg = f"Token budget exceeded: {state.total_tokens} > {self.max_token_budget}"
+                    logger.error(error_msg)
+                    state.fail(error_msg, reason="budget_exceeded")
                     break
                 
                 # Log token usage
@@ -130,18 +135,25 @@ class AgentLoop:
                     await self._handle_action(state, response, token_metadata)
                 elif response.type == "finish":
                     await self._handle_finish(state, response, token_metadata)
-                    break
-                
-                # Call step callback if provided
+
+                # Invariant: on_step fires after EVERY executed step,
+                # including the terminating one, so streamers/observers
+                # always see the final state.
                 if on_step:
                     await on_step(state)
-                
+
+                if not state.should_continue():
+                    break
+
                 # Small delay to prevent tight loops
                 await asyncio.sleep(0.1)
-            
+
             # Check if we exited without finishing
             if not state.is_finished:
-                state.fail("Agent stopped without finishing (max steps reached)")
+                state.fail(
+                    "Agent stopped without finishing (max steps reached)",
+                    reason="max_steps",
+                )
             
             logger.info(f"Agent run {state.run_id} completed: {state.current_step} steps")
             
@@ -182,7 +194,6 @@ class AgentLoop:
                 )
                 
                 # Try to validate the response has required fields
-                import json
                 try:
                     data = json.loads(response_text.strip())
                     if "type" not in data:
@@ -230,7 +241,7 @@ class AgentLoop:
                     latency_ms=token_metadata.get("latency_ms", 0),
                     error_details={"stage": "guardrail", "message": loop_error, "recoverable": False}
                 )
-                state.fail(loop_error)
+                state.fail(loop_error, reason="loop_detected")
                 return
         
         state.add_trace_entry(
@@ -270,7 +281,7 @@ class AgentLoop:
                 latency_ms=token_metadata.get("latency_ms", 0),
                 error_details={"stage": "tool_execution", "message": error_msg, "recoverable": False}
             )
-            state.add_message("assistant", f"Error: {error_msg}")
+            state.add_message("user", f"Error: {error_msg}")
             return
 
         # Enforce tool authorization — registration alone does not grant
@@ -288,7 +299,7 @@ class AgentLoop:
                 latency_ms=token_metadata.get("latency_ms", 0),
                 error_details={"stage": "guardrail", "message": error_msg, "recoverable": True}
             )
-            state.add_message("assistant", f"Error: {error_msg}")
+            state.add_message("user", f"Error: {error_msg}")
             return
 
         # Validate arguments against schema
@@ -308,9 +319,9 @@ class AgentLoop:
                 latency_ms=token_metadata.get("latency_ms", 0),
                 error_details={"stage": "tool_execution", "message": error_msg, "recoverable": True}
             )
-            state.add_message("assistant", f"Error: {error_msg}")
+            state.add_message("user", f"Error: {error_msg}")
             return
-        
+
         # Check guardrails
         is_valid, guardrail_error = self.guardrails.validate_tool_call(tool_name, arguments)
         if not is_valid:
@@ -325,8 +336,8 @@ class AgentLoop:
                 latency_ms=token_metadata.get("latency_ms", 0),
                 error_details={"stage": "guardrail", "message": guardrail_error, "recoverable": False}
             )
-            state.add_message("assistant", f"Error: {guardrail_error}")
-            state.fail(guardrail_error)
+            state.add_message("user", f"Error: {guardrail_error}")
+            state.fail(guardrail_error, reason="loop_detected")
             return
         
         # Execute tool with timeout
@@ -349,8 +360,15 @@ class AgentLoop:
             )
             execution_time = time.time() - start_time
             
-            # Convert result to string for observation
-            observation = str(result)
+            # Serialize the tool result into a consistent observation
+            # (JSON for structured results, plain string otherwise)
+            if isinstance(result, str):
+                observation = result
+            else:
+                try:
+                    observation = json.dumps(result, default=str)
+                except (TypeError, ValueError):
+                    observation = str(result)
             logger.log_observation(tool_name, observation)
             
             state.add_trace_entry(
@@ -361,7 +379,9 @@ class AgentLoop:
                 execution_time=execution_time
             )
             
-            state.add_message("assistant", f"Observation: {observation}")
+            # Observations come from the environment, not the assistant —
+            # use the "user" role to match chat-provider conventions.
+            state.add_message("user", f"Observation: {observation}")
             
         except asyncio.TimeoutError:
             error_msg = f"Tool execution timed out after {self.tool_timeout}s"
@@ -374,9 +394,9 @@ class AgentLoop:
                 execution_time=self.tool_timeout,
                 error_details={"stage": "timeout", "message": error_msg, "recoverable": True}
             )
-            state.add_message("assistant", f"Error: {error_msg}")
+            state.add_message("user", f"Error: {error_msg}")
         except Exception as e:
-            error_msg = f"Tool execution error: {str(e)}"
+            error_msg = f"Tool execution error: {type(e).__name__}: {e}"
             logger.error(error_msg)
             state.add_trace_entry(
                 entry_type="error",
@@ -385,7 +405,7 @@ class AgentLoop:
                 tool_name=tool_name,
                 error_details={"stage": "tool_execution", "message": error_msg, "recoverable": True}
             )
-            state.add_message("assistant", f"Error: {error_msg}")
+            state.add_message("user", f"Error: {error_msg}")
     
     async def _handle_finish(
         self,

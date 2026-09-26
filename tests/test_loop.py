@@ -80,6 +80,7 @@ class TestHappyPath:
         assert state.is_finished
         assert state.error is None
         assert state.final_answer == "The answer is 5"
+        assert state.termination_reason == "completed"
         assert state.current_step == 3
 
     async def test_direct_finish(self):
@@ -137,12 +138,6 @@ class TestHappyPath:
         steps = [e.step_number for e in state.trace]
         assert steps == sorted(steps)
 
-    @pytest.mark.xfail(
-        reason="BUG: on_step is never invoked for the step that produces "
-               "'finish' — loop.py breaks out of the while loop before the "
-               "on_step call, so streaming consumers miss the final step",
-        strict=False,
-    )
     async def test_on_step_callback_async(self):
         loop, _ = make_loop([finish_response("done")])
         seen_steps = []
@@ -337,6 +332,7 @@ class TestTermination:
         assert state.is_finished
         assert state.error is not None
         assert "max steps" in state.error.lower()
+        assert state.termination_reason == "max_steps"
         assert state.current_step == 3
 
     async def test_token_budget_termination(self):
@@ -350,6 +346,7 @@ class TestTermination:
 
         assert state.is_finished
         assert "budget" in state.error.lower()
+        assert state.termination_reason == "budget_exceeded"
 
     async def test_tool_loop_detection_terminates(self):
         # Same tool + same args twice in a row -> fingerprint loop
@@ -360,6 +357,7 @@ class TestTermination:
         assert state.is_finished
         assert state.error is not None
         assert "loop" in state.error.lower()
+        assert state.termination_reason == "loop_detected"
 
     async def test_thought_loop_terminates(self):
         same = thought_response("identical reasoning")
@@ -368,6 +366,7 @@ class TestTermination:
 
         assert state.is_finished
         assert "loop" in state.error.lower()
+        assert state.termination_reason == "loop_detected"
 
 
 # ---------------------------------------------------------------------------

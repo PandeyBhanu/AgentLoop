@@ -265,16 +265,22 @@ class LLMClient:
     ) -> tuple[str, Dict[str, Any]]:
         """Send request to Gemini API."""
         start_time = time.time()
-        
-        # Convert messages to Gemini format
+
+        # Convert messages to Gemini format. Gemini does not accept a
+        # "system" role in contents — system instructions go in the
+        # dedicated system_instruction field instead.
         contents = []
+        system_texts = []
         for msg in messages:
+            if msg.role == "system":
+                system_texts.append(msg.content)
+                continue
             role = "user" if msg.role == "user" else "model"
             contents.append({
                 "role": role,
                 "parts": [{"text": msg.content}]
             })
-        
+
         # Build request payload
         payload = {
             "contents": contents,
@@ -283,6 +289,10 @@ class LLMClient:
                 "maxOutputTokens": self.config.max_tokens
             }
         }
+        if system_texts:
+            payload["system_instruction"] = {
+                "parts": [{"text": "\n\n".join(system_texts)}]
+            }
         
         # Make API request — the key goes in a header, never in the URL,
         # so it cannot leak via URLs embedded in logs or error messages.

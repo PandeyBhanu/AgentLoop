@@ -21,6 +21,10 @@ class AgentState(BaseModel):
     is_finished: bool = Field(default=False, description="Whether the run is finished")
     final_answer: Optional[str] = Field(None, description="Final answer when finished")
     error: Optional[str] = Field(None, description="Error message if run failed")
+    termination_reason: Optional[str] = Field(
+        None,
+        description="Why the run ended: completed | error | max_steps | budget_exceeded | loop_detected"
+    )
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Run creation timestamp")
     total_tokens: int = Field(default=0, description="Total tokens used in the run")
     total_cost: float = Field(default=0.0, description="Total estimated cost in USD")
@@ -77,12 +81,19 @@ class AgentState(BaseModel):
             error_details=error_details
         )
         self.trace.append(entry)
-        
-        # Update total tokens if provided
-        if tokens_input:
-            self.total_tokens += tokens_input
-        if tokens_output:
-            self.total_tokens += tokens_output
+
+    def record_usage(self, token_metadata: Dict[str, Any]) -> None:
+        """
+        Accumulate token usage and cost for one LLM call.
+
+        This is the single writer for total_tokens / total_cost — trace
+        entries only annotate per-step usage, they do not accumulate it.
+
+        Args:
+            token_metadata: metadata dict returned by the LLM client
+        """
+        self.total_tokens += token_metadata.get("total_tokens", 0) or 0
+        self.total_cost += token_metadata.get("estimated_cost", 0.0) or 0.0
     
     def increment_step(self) -> None:
         """Increment the current step counter."""
@@ -112,16 +123,19 @@ class AgentState(BaseModel):
         """
         self.is_finished = True
         self.final_answer = str(final_answer)
+        self.termination_reason = "completed"
     
-    def fail(self, error: str) -> None:
+    def fail(self, error: str, reason: str = "error") -> None:
         """
-        Mark the run as failed with an error.
+        Mark the run as failed with an error and a termination reason.
         
         Args:
             error: Error message
+            reason: Termination reason (error | max_steps | budget_exceeded | loop_detected)
         """
         self.is_finished = True
         self.error = error
+        self.termination_reason = reason
     
     def get_last_n_messages(self, n: int) -> List[Message]:
         """
@@ -155,6 +169,7 @@ class AgentState(BaseModel):
             "is_finished": self.is_finished,
             "final_answer": self.final_answer,
             "error": self.error,
+            "termination_reason": self.termination_reason,
             "created_at": self.created_at.isoformat(),
             "total_tokens": self.total_tokens,
             "total_cost": self.total_cost,

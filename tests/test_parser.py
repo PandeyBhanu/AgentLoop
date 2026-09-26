@@ -81,33 +81,22 @@ class TestParseInvalid:
         with pytest.raises(ValueError):
             ResponseParser.parse("")
 
-    @pytest.mark.xfail(
-        reason="BUG: valid non-object JSON (list/scalar) raises AttributeError "
-               "instead of ValueError — data.get() is called on a list",
-        strict=False,
-    )
     def test_json_array_not_object(self):
         # A valid JSON array has no "type" field
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="JSON object"):
             ResponseParser.parse('["thought", "action"]')
 
-    @pytest.mark.xfail(
-        reason="BUG: valid non-object JSON (list/scalar) raises AttributeError "
-               "instead of ValueError — data.get() is called on a list",
-        strict=False,
-    )
     def test_json_scalar_not_object(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="JSON object"):
             ResponseParser.parse('42')
 
-    @pytest.mark.xfail(
-        reason="BUG: parser rejects empty arguments dict — `if not data.get('arguments')` "
-               "treats {} as missing; tools with no required inputs can never be called",
-        strict=False,
-    )
     def test_action_with_empty_arguments(self):
         r = ResponseParser.parse('{"type": "action", "tool_name": "Ping", "arguments": {}}')
         assert r.arguments == {}
+
+    def test_action_with_non_dict_arguments(self):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            ResponseParser.parse('{"type": "action", "tool_name": "X", "arguments": "nope"}')
 
 
 # ---------------------------------------------------------------------------
