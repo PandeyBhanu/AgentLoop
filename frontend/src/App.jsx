@@ -54,16 +54,21 @@ function App() {
             }));
           }
           if (data.type === 'tool_call') {
-            setToolLogs((prev) => [...prev, data.tool_call]);
+            setToolLogs((prev) => [...prev, data.tool_call || { tool_name: data.tool_name, success: null }]);
+          }
+          if (data.type === 'tool_result') {
+            setToolLogs((prev) => [...prev, { tool_name: data.tool_name, success: true, result: data.result }]);
           }
           if (data.type === 'metrics') {
+            const metrics = data.metrics || data;
             setMetrics((prev) => ({
               ...prev,
-              totalTokens: data.metrics.total_tokens,
-              totalCost: data.metrics.total_cost,
+              totalTokens: metrics.total_tokens,
+              totalCost: metrics.total_cost,
             }));
           }
           if (data.type === 'finish') {
+            setMessages((prev) => [...prev, { role: 'assistant', content: data.error || data.final_answer || 'No answer provided' }]);
             setIsRunning(false);
             setMetrics((prev) => ({ ...prev, isRunning: false }));
             runCompletedRef.current = true;
@@ -112,7 +117,7 @@ function App() {
     setShowReplay(false);
 
     try {
-      const response = await api.chat(
+      const response = await api.createRun(
         message,
         10,
         allowedTools,
@@ -126,16 +131,20 @@ function App() {
         totalCost: response.total_tokens ? response.total_tokens * 0.00003 : 0,
       }));
 
-      if (response.error) {
-        setMessages((prev) => [...prev, { role: 'assistant', content: response.error }]);
-      } else {
-        setMessages((prev) => [...prev, { role: 'assistant', content: response.final_answer }]);
-      }
     } catch (error) {
       console.error('Error sending message:', error);
       setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${error.message}` }]);
       setIsRunning(false);
       setMetrics((prev) => ({ ...prev, isRunning: false }));
+    }
+  };
+
+  const handleCancel = async () => {
+    if (!currentRunId) return;
+    try {
+      await api.cancelRun(currentRunId);
+    } catch (error) {
+      setMessages((prev) => [...prev, { role: 'assistant', content: `Cancel failed: ${error.message}` }]);
     }
   };
 
@@ -195,9 +204,17 @@ function App() {
             />
           </div>
 
+          {isRunning && (
+            <button
+              onClick={handleCancel}
+              className="ml-auto px-4 py-1 bg-red-600 hover:bg-red-700 rounded text-sm font-medium transition-colors"
+            >
+              Cancel Run
+            </button>
+          )}
           <button
             onClick={() => setShowReplay(!showReplay)}
-            className="ml-auto px-4 py-1 bg-purple-600 hover:bg-purple-700 rounded text-sm font-medium transition-colors"
+            className={`${isRunning ? '' : 'ml-auto '}px-4 py-1 bg-purple-600 hover:bg-purple-700 rounded text-sm font-medium transition-colors`}
           >
             {showReplay ? 'Hide Replay' : 'Show Replay'}
           </button>

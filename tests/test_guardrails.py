@@ -62,6 +62,32 @@ class TestToolCallLoopDetection:
         ok, err = guardrails.validate_tool_call("Calculator", {"a": 1})
         assert not ok
 
+    def test_alternating_action_sequence_detected_with_changing_arguments(self, guardrails):
+        # Operation signatures repeat while payload values vary: add(a) -> search -> add(b) -> search.
+        assert guardrails.check_loop("Calculator", {"operation": "add", "a": 1, "b": 2})[0]
+        assert guardrails.check_loop("FileReader", {"file_path": "one.txt"})[0]
+        assert guardrails.check_loop("Calculator", {"operation": "add", "a": 9, "b": 9})[0]
+        ok, err = guardrails.check_loop("FileReader", {"file_path": "two.txt"})
+        assert not ok
+        assert "action sequence" in err.lower()
+
+    def test_excessive_similar_tool_frequency_detected(self):
+        g = Guardrails(max_tool_frequency=3)
+        for value in range(3):
+            assert g.check_loop("Calculator", {"operation": "add", "a": value, "b": 1})[0]
+        ok, err = g.check_loop("Calculator", {"operation": "add", "a": 99, "b": 1})
+        assert not ok
+        assert "too frequently" in err.lower()
+
+    def test_legitimate_different_operations_do_not_form_cycle(self, guardrails):
+        calls = [
+            {"operation": "add", "a": 1, "b": 2},
+            {"operation": "subtract", "a": 5, "b": 1},
+            {"operation": "multiply", "a": 2, "b": 3},
+        ]
+        for args in calls:
+            assert guardrails.check_loop("Calculator", args)[0]
+
 
 class TestThoughtLoopDetection:
     def test_unique_thoughts_pass(self, guardrails):

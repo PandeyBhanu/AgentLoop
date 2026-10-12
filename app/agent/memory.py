@@ -3,7 +3,7 @@ Lightweight memory interface for agent state persistence.
 """
 from typing import Dict, Any, Optional, List
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class Memory:
@@ -25,7 +25,7 @@ class Memory:
             value: Value to store
         """
         self._storage[key] = value
-        self._timestamps[key] = datetime.utcnow()
+        self._timestamps[key] = datetime.now(timezone.utc)
     
     async def retrieve(self, query: str) -> Optional[Any]:
         """

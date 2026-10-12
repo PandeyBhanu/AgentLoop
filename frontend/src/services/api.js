@@ -1,6 +1,33 @@
 const API_BASE = '/api';
+const API_KEY = import.meta.env.VITE_AGENTLOOP_API_KEY || localStorage.getItem('agentloop-api-key') || '';
+
+const authHeaders = (headers = {}) => (
+  API_KEY ? { ...headers, 'X-API-Key': API_KEY } : headers
+);
 
 export const api = {
+  async createRun(message, maxSteps = 10, allowedTools = null, maxTokenBudget = null) {
+    const payload = { message, max_steps: maxSteps };
+    if (allowedTools && allowedTools.length > 0) payload.allowed_tools = allowedTools;
+    if (maxTokenBudget) payload.max_token_budget = maxTokenBudget;
+    const response = await fetch(`${API_BASE}/runs`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    return response.json();
+  },
+
+  async cancelRun(runId) {
+    const response = await fetch(`${API_BASE}/runs/${runId}/cancel`, {
+      method: 'POST',
+      headers: authHeaders(),
+    });
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    return response.json();
+  },
+
   async chat(message, maxSteps = 10, allowedTools = null, maxTokenBudget = null) {
     const payload = {
       message,
@@ -17,7 +44,7 @@ export const api = {
 
     const response = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
     });
 
@@ -29,7 +56,9 @@ export const api = {
   },
 
   async getTrace(runId) {
-    const response = await fetch(`${API_BASE}/trace/${runId}`);
+    const response = await fetch(`${API_BASE}/trace/${runId}`, {
+      headers: authHeaders(),
+    });
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -37,7 +66,9 @@ export const api = {
   },
 
   async replay(runId) {
-    const response = await fetch(`${API_BASE}/replay/${runId}`);
+    const response = await fetch(`${API_BASE}/replay/${runId}`, {
+      headers: authHeaders(),
+    });
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -45,7 +76,9 @@ export const api = {
   },
 
   async replayWithAnalysis(runId) {
-    const response = await fetch(`${API_BASE}/replay/${runId}/analysis`);
+    const response = await fetch(`${API_BASE}/replay/${runId}/analysis`, {
+      headers: authHeaders(),
+    });
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -53,22 +86,45 @@ export const api = {
   },
 
   createEventSource(runId, onMessage, onError) {
-    const eventSource = new EventSource(`${API_BASE}/stream/${runId}`);
+    const controller = new AbortController();
+    const decoder = new TextDecoder();
+    let buffer = '';
 
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        onMessage(data);
-      } catch (e) {
-        console.error('Failed to parse SSE message:', e);
+    const readEvents = async () => {
+      const response = await fetch(`${API_BASE}/stream/${runId}`, {
+        headers: authHeaders({ Accept: 'text/event-stream' }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const reader = response.body.getReader();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const data = frame
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trim())
+            .join('\n');
+          if (data) onMessage(JSON.parse(data));
+        }
       }
     };
 
-    eventSource.onerror = (error) => {
-      console.error('SSE error:', error);
-      if (onError) onError(error);
-    };
+    readEvents().catch((error) => {
+      if (!controller.signal.aborted && onError) onError(error);
+    });
 
-    return eventSource;
+    return {
+      close: () => controller.abort(),
+      get readyState() {
+        return controller.signal.aborted ? 2 : 0;
+      },
+    };
   },
 };

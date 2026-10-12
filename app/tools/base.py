@@ -3,8 +3,6 @@ Base class for all tools in the agent system.
 """
 from abc import ABC, abstractmethod
 from typing import Any, Dict
-from pydantic import BaseModel
-import json
 
 
 class BaseTool(ABC):
@@ -52,6 +50,25 @@ class BaseTool(ABC):
         """
         pass
     
+    def get_output_schema(self) -> Dict[str, Any]:
+        return {"type": "object"}
+
+    @property
+    def output_schema(self) -> Dict[str, Any]:
+        return self.get_output_schema()
+
+    @property
+    def timeout(self) -> int:
+        return 30
+
+    @property
+    def risk_level(self) -> str:
+        return "low"
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {}
+
     def to_definition(self) -> Dict[str, Any]:
         """
         Convert tool to a definition dictionary.
@@ -62,5 +79,9 @@ class BaseTool(ABC):
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self.input_schema
+            "input_schema": self.input_schema,
+            "output_schema": self.output_schema,
+            "timeout": self.timeout,
+            "risk_level": self.risk_level,
+            "metadata": self.metadata
         }

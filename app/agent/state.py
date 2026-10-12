@@ -3,7 +3,7 @@ Agent state management for tracking conversation history and execution state.
 """
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timezone
 from app.schemas.messages import Message, TraceEntry
 import uuid
 
@@ -25,9 +25,11 @@ class AgentState(BaseModel):
         None,
         description="Why the run ended: completed | error | max_steps | budget_exceeded | loop_detected"
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Run creation timestamp")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Run creation timestamp")
     total_tokens: int = Field(default=0, description="Total tokens used in the run")
     total_cost: float = Field(default=0.0, description="Total estimated cost in USD")
+    tool_calls: int = Field(default=0, description="Tool invocations started")
+    phase: str = Field(default="START", description="Current execution phase")
     
     def add_message(self, role: str, content: Any) -> None:
         """
@@ -70,7 +72,7 @@ class AgentState(BaseModel):
         entry = TraceEntry(
             type=entry_type,
             content=content,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             step_number=step_number,
             tool_name=tool_name,
             execution_time=execution_time,
@@ -124,6 +126,7 @@ class AgentState(BaseModel):
         self.is_finished = True
         self.final_answer = str(final_answer)
         self.termination_reason = "completed"
+        self.phase = "FINISH"
     
     def fail(self, error: str, reason: str = "error") -> None:
         """
@@ -136,6 +139,7 @@ class AgentState(BaseModel):
         self.is_finished = True
         self.error = error
         self.termination_reason = reason
+        self.phase = "CANCELLED" if reason == "cancelled" else "FAILURE"
     
     def get_last_n_messages(self, n: int) -> List[Message]:
         """
@@ -173,4 +177,6 @@ class AgentState(BaseModel):
             "created_at": self.created_at.isoformat(),
             "total_tokens": self.total_tokens,
             "total_cost": self.total_cost,
+            "tool_calls": self.tool_calls,
+            "phase": self.phase,
         }

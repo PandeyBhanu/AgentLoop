@@ -3,13 +3,16 @@ Tests for the tool system: registry, validation, and each tool's execution.
 """
 import asyncio
 import time
+import subprocess
+import shutil
 
 import pytest
 
 from app.tools.base import BaseTool
 from app.tools.registry import ToolRegistry
 from app.tools.calculator import Calculator
-from app.tools.web_search import WebSearch
+from app.tools.web_search import WebSearch, SearchResult, SearxngProvider, valid_result_url
+import httpx
 from app.tools.file_reader import FileReader
 from app.tools.python_exec import PythonExec
 from app.schemas.tools import validate_tool_inputs
@@ -88,6 +91,22 @@ class TestRegistry:
         assert d["name"] == "Calculator"
         assert isinstance(d["description"], str)
         assert d["input_schema"]["type"] == "object"
+        assert d["output_schema"]["type"] == "object"
+        assert d["risk_level"] in ("low", "medium", "high")
+        assert d["timeout"] > 0
+
+    def test_invalid_tool_rejected(self):
+        reg = ToolRegistry()
+        with pytest.raises(TypeError):
+            reg.register(object())
+        tool = DummyTool()
+        tool.input_schema = {"type": "not-a-json-schema-type"}
+        with pytest.raises(ValueError):
+            reg.register(tool)
+        tool = DummyTool()
+        tool.description = ""
+        with pytest.raises(ValueError):
+            reg.register(tool)
 
     def test_definitions_filterable_by_allowed_tools(self, registry):
         """Simulates the allowed_tools filtering done in AgentLoop.run."""
@@ -131,13 +150,29 @@ class TestSchemaValidation:
         )
         assert not result.valid
 
-    def test_extra_properties_allowed(self, registry):
-        # Schema does not set additionalProperties: false
+    def test_extra_properties_rejected(self, registry):
         tool = registry.get("Calculator")
         result = validate_tool_inputs(
             {"operation": "add", "a": 1, "b": 2, "extra": "x"}, tool.input_schema
         )
-        assert result.valid
+        assert not result.valid
+
+    def test_binary_operation_requires_b(self, registry):
+        schema = registry.get("Calculator").input_schema
+        assert not validate_tool_inputs({"operation": "divide", "a": 4}, schema).valid
+
+    def test_factorial_requires_integer_and_bound(self, registry):
+        schema = registry.get("Calculator").input_schema
+        assert not validate_tool_inputs({"operation": "factorial", "a": 3.9}, schema).valid
+        assert not validate_tool_inputs({"operation": "factorial", "a": 1001}, schema).valid
+
+    def test_python_timeout_schema_bound(self):
+        schema = PythonExec().input_schema
+        assert not validate_tool_inputs({"code": "1+1", "timeout": 31}, schema).valid
+
+    def test_search_query_schema_bound(self):
+        schema = WebSearch().input_schema
+        assert not validate_tool_inputs({"query": "x" * 501}, schema).valid
 
 
 # ---------------------------------------------------------------------------
@@ -193,20 +228,48 @@ class TestCalculator:
 # ---------------------------------------------------------------------------
 
 class TestWebSearch:
+    class StubProvider:
+        async def search(self, query, limit):
+            return [SearchResult(title=f"Result {i} for {query}", url=f"https://example.org/{i}", snippet="text", source="test") for i in range(limit)]
+
     async def test_returns_results(self):
-        r = await WebSearch().execute({"query": "test query", "num_results": 3})
+        r = await WebSearch(provider=self.StubProvider()).execute({"query": "test query", "num_results": 3})
         assert r["query"] == "test query"
         assert len(r["results"]) == 3
         assert r["total_results"] == 3
         assert all("test query" in res["title"] for res in r["results"])
+        assert all(res["source"] == "test" for res in r["results"])
 
-    async def test_caps_at_ten_results(self):
-        r = await WebSearch().execute({"query": "q", "num_results": 50})
-        assert len(r["results"]) == 10
+    async def test_unconfigured_search_does_not_fabricate_results(self, monkeypatch):
+        monkeypatch.delenv("SEARCH_PROVIDER", raising=False)
+        r = await WebSearch().execute({"query": "q"})
+        assert r["results"] == []
+        assert "error" in r
 
     async def test_default_num_results(self):
-        r = await WebSearch().execute({"query": "q"})
+        r = await WebSearch(provider=self.StubProvider()).execute({"query": "q"})
         assert len(r["results"]) == 5
+
+    async def test_provider_disables_redirects_and_filters_private_urls(self):
+        def handle(request):
+            assert request.url.path == "/search"
+            assert request.url.params["q"] == "q"
+            return httpx.Response(200, json={"results": [
+                {"title": "public", "url": "https://example.org/news", "content": "snippet", "engine": "test"},
+                {"title": "private", "url": "http://127.0.0.1/admin", "content": "bad"},
+            ]})
+
+        provider = SearxngProvider("https://search.example.org", transport=httpx.MockTransport(handle))
+        r = await WebSearch(provider=provider).execute({"query": "q"})
+        assert len(r["results"]) == 1
+        assert r["results"][0]["url"] == "https://example.org/news"
+        assert not valid_result_url("http://169.254.169.254/latest/meta-data")
+
+    async def test_provider_redirect_rejected(self):
+        transport = httpx.MockTransport(lambda request: httpx.Response(302, headers={"Location": "http://127.0.0.1/"}))
+        provider = SearxngProvider("https://search.example.org", transport=transport)
+        r = await WebSearch(provider=provider).execute({"query": "q"})
+        assert r["results"] == [] and "error" in r
 
 
 # ---------------------------------------------------------------------------
@@ -282,17 +345,22 @@ class TestPythonExec:
         monkeypatch.setenv("AGENTLOOP_ENABLE_PYTHON_EXEC", "1")
         return PythonExec()
 
-    async def test_simple_expression(self, pyexec):
+    @pytest.fixture
+    def docker_worker(self):
+        if not shutil.which("docker") or subprocess.run(["docker", "image", "inspect", "agentloop-python-worker:local"], capture_output=True).returncode:
+            pytest.skip("Docker worker image unavailable; build Dockerfile.python-worker to run isolation tests")
+
+    async def test_simple_expression(self, pyexec, docker_worker):
         r = await pyexec.execute({"code": "2 + 2"})
         assert r["success"] is True
         assert r["output"] == "4"
 
-    async def test_math_module(self, pyexec):
+    async def test_math_module(self, pyexec, docker_worker):
         r = await pyexec.execute({"code": "math.sqrt(16)"})
         assert r["success"] is True
         assert r["output"] == "4.0"
 
-    async def test_print_statement(self, pyexec):
+    async def test_print_statement(self, pyexec, docker_worker):
         r = await pyexec.execute({"code": 'print("hello")'})
         assert r["success"] is True
         assert "hello" in r["output"]
@@ -309,16 +377,15 @@ class TestPythonExec:
         r = await pyexec.execute({"code": "x = 5"})
         assert r["success"] is False
 
-    async def test_runtime_error_structured(self, pyexec):
+    async def test_runtime_error_structured(self, pyexec, docker_worker):
         r = await pyexec.execute({"code": "1 / 0"})
         assert r["success"] is False
         assert r["error"] == "Execution failed"
 
     async def test_execution_timeout(self, pyexec, monkeypatch):
-        # Patch the evaluator to sleep; avoids a real slow computation.
-        monkeypatch.setattr(
-            pyexec, "_safe_eval", lambda code, local_vars: time.sleep(5)
-        )
+        async def slow_container(code, timeout):
+            raise asyncio.TimeoutError()
+        monkeypatch.setattr(pyexec, "_run_container", slow_container)
         r = await pyexec.execute({"code": "1 + 1", "timeout": 1})
         assert r["success"] is False
         assert "timed out" in r["details"].lower()
@@ -327,7 +394,7 @@ class TestPythonExec:
         r = await pyexec.execute({"code": "().__class__.__base__.__subclasses__()"})
         assert r["success"] is False
 
-    async def test_cos_function_allowed(self, pyexec):
+    async def test_cos_function_allowed(self, pyexec, docker_worker):
         r = await pyexec.execute({"code": "cos(0)"})
         assert r["success"] is True
         assert r["output"] == "1.0"

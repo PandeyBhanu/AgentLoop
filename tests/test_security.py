@@ -13,6 +13,8 @@ import json
 import math
 import os
 import sys
+import subprocess
+import shutil
 
 import pytest
 from fastapi.testclient import TestClient
@@ -198,24 +200,28 @@ class TestPythonExecWhitelist:
         ("pi", str(math.pi)),
     ])
     async def test_legitimate_expressions_work(self, pyexec, expr, expected):
+        if not shutil.which("docker") or subprocess.run(["docker", "image", "inspect", "agentloop-python-worker:local"], capture_output=True).returncode:
+            pytest.skip("Docker worker image unavailable")
         r = await pyexec.execute({"code": expr})
         assert r["success"] is True
         assert r["output"] == expected
 
     async def test_output_capped(self, pyexec, monkeypatch):
-        monkeypatch.setattr(
-            "app.tools.python_exec.MAX_OUTPUT_CHARS", 100
-        )
+        async def oversized(code, timeout):
+            return "Output limit exceeded"
+        monkeypatch.setattr(pyexec, "_run_container", oversized)
         r = await pyexec.execute({"code": "'x' * 5000"})
-        assert r["success"] is True
-        assert len(r["output"]) <= 200  # capped + truncation marker
+        assert r["success"] is False
+        assert "limit" in r["details"].lower()
 
-    async def test_timeout_clamped(self, pyexec):
-        # Excessive timeout values must be clamped, not trusted.
+    async def test_timeout_rejected(self, pyexec):
+        # Excessive timeout values must be rejected, not trusted.
         r = await pyexec.execute({"code": "1 + 1", "timeout": 999999})
-        assert r["success"] is True
+        assert r["success"] is False
 
     async def test_no_stdout_leak(self, pyexec, capfd):
+        if not shutil.which("docker") or subprocess.run(["docker", "image", "inspect", "agentloop-python-worker:local"], capture_output=True).returncode:
+            pytest.skip("Docker worker image unavailable")
         await pyexec.execute({"code": 'print("SHOULD_BE_CAPTURED")'})
         out, _ = capfd.readouterr()
         assert "SHOULD_BE_CAPTURED" not in out
@@ -365,3 +371,102 @@ class TestApiKeyAuth:
     def test_401_does_not_leak_details(self, protected_client):
         r = protected_client.post("/api/chat", json={"message": "hi"})
         assert r.json() == {"detail": "Unauthorized"}
+
+
+class TestRunOwnership:
+    def test_users_cannot_read_or_cancel_each_others_runs(self, monkeypatch):
+        monkeypatch.setenv("AGENTLOOP_USERS_JSON", json.dumps({
+            "alice": {"api_key": "alice-test-key", "allowed_tools": ["Calculator"]},
+            "bob": {"api_key": "bob-test-key", "allowed_tools": []},
+        }))
+        import main
+        import app.api.routes as routes
+        from conftest import ScriptedLLM
+        monkeypatch.setattr(routes, "llm_client", ScriptedLLM([finish_response("ok")]))
+        importlib.reload(main)
+        with TestClient(main.app) as client:
+            alice = {"X-API-Key": "alice-test-key"}
+            bob = {"X-API-Key": "bob-test-key"}
+            run_id = client.post("/api/chat", json={"message": "hi"}, headers=alice).json()["run_id"]
+            assert client.get(f"/api/trace/{run_id}", headers=alice).status_code == 200
+            assert client.get(f"/api/trace/{run_id}", headers=bob).status_code == 404
+            assert client.get(f"/api/stream/{run_id}", headers=bob).status_code == 404
+            assert client.get(f"/api/replay/{run_id}", headers=bob).status_code == 404
+            live_id = client.post("/api/runs", json={"message": "hi"}, headers=alice).json()["run_id"]
+            assert client.post(f"/api/runs/{live_id}/cancel", headers=bob).status_code == 404
+        monkeypatch.delenv("AGENTLOOP_USERS_JSON")
+        importlib.reload(main)
+
+    def test_server_policy_does_not_grant_client_requested_tool(self, monkeypatch):
+        monkeypatch.setenv("AGENTLOOP_USERS_JSON", json.dumps({
+            "bob": {"api_key": "bob-test-key", "allowed_tools": []}
+        }))
+        import main
+        import app.api.routes as routes
+        from conftest import ScriptedLLM
+        fake = ScriptedLLM([finish_response("ok")])
+        monkeypatch.setattr(routes, "llm_client", fake)
+        importlib.reload(main)
+        with TestClient(main.app) as client:
+            r = client.post("/api/chat", json={"message": "hi", "allowed_tools": ["Calculator"]},
+                            headers={"X-API-Key": "bob-test-key"})
+            assert r.status_code == 200
+            assert fake.calls[0]["tool_schemas"] == []
+        monkeypatch.delenv("AGENTLOOP_USERS_JSON")
+        importlib.reload(main)
+
+
+class TestPythonContainerIsolation:
+    @pytest.fixture
+    def worker(self):
+        if not shutil.which("docker") or subprocess.run(
+            ["docker", "image", "inspect", "agentloop-python-worker:local"], capture_output=True
+        ).returncode:
+            pytest.skip("Docker worker image unavailable")
+        return PythonExec()
+
+    async def probe(self, worker, script):
+        import uuid
+        proc = await asyncio.create_subprocess_exec(
+            *worker._docker_args(f"agentloop-test-{uuid.uuid4().hex}"), "python", "-c", script,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(b""), 15)
+        assert proc.returncode == 0, stderr.decode()
+        return stdout.decode().strip()
+
+    async def test_no_host_secrets_and_read_only_root(self, worker, monkeypatch):
+        monkeypatch.setenv("AGENTLOOP_TEST_SECRET", "host-secret")
+        output = await self.probe(worker,
+            "import os; print(os.getenv('AGENTLOOP_TEST_SECRET', 'absent')); "
+            "print(os.geteuid()); "
+            "print('blocked' if not os.access('/etc', os.W_OK) else 'writable')")
+        assert output.splitlines() == ["absent", "65534", "blocked"]
+
+    async def test_network_disabled_and_cgroup_limits(self, worker):
+        output = await self.probe(worker,
+            "import socket; s=socket.socket(); "
+            "print('blocked' if s.connect_ex(('198.51.100.1', 80)) != 0 else 'connected'); "
+            "print(open('/sys/fs/cgroup/pids.max').read().strip()); "
+            "print(open('/sys/fs/cgroup/memory.max').read().strip())")
+        network, pids, memory = output.splitlines()
+        assert network == "blocked"
+        assert int(pids) <= 16
+        assert int(memory) <= 128 * 1024 * 1024
+
+    async def test_timeout_kills_worker_and_output_bounded(self, worker, monkeypatch):
+        monkeypatch.setenv("AGENTLOOP_ENABLE_PYTHON_EXEC", "1")
+        result = await worker.execute({"code": "'x' * 20000"})
+        assert not result["success"] and "limit" in result["details"].lower()
+        with pytest.raises(asyncio.TimeoutError):
+            await worker._run_container("sum(x for x in range(1000000000))", 1)
+        await asyncio.sleep(0.2)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "ps", "--filter", "name=agentloop-", "--format", "{{.Names}}",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        import re
+        assert not any(re.fullmatch(r"agentloop-[0-9a-f]{32}", name)
+                       for name in stdout.decode().splitlines())

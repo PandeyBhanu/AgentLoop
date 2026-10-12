@@ -1,7 +1,7 @@
 """
 FastAPI routes for the agent API.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from typing import Dict
 from app.schemas.messages import ChatRequest, ChatResponse
 from app.agent.loop import AgentLoop
@@ -13,7 +13,7 @@ from app.tools.file_reader import FileReader
 from app.tools.python_exec import PythonExec
 from app.agent.replay import replay, replay_with_analysis
 from app.storage import runs
-import asyncio
+from app.utils.logger import metrics
 import os
 
 
@@ -52,9 +52,25 @@ llm_client = get_llm_client()
 
 router = APIRouter()
 
+MAX_ACTIVE_RUNS = int(os.getenv("AGENTLOOP_MAX_ACTIVE_RUNS", "20"))
+_active_runs = 0
+
+
+def acquire_run_slot() -> bool:
+    global _active_runs
+    if _active_runs >= MAX_ACTIVE_RUNS:
+        return False
+    _active_runs += 1
+    return True
+
+
+def release_run_slot() -> None:
+    global _active_runs
+    _active_runs = max(0, _active_runs - 1)
+
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     """
     Process a user message through the agent loop.
     
@@ -64,6 +80,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Returns:
         ChatResponse with run_id, final_answer, steps, total_tokens, and error if any
     """
+    if not acquire_run_slot():
+        raise HTTPException(status_code=429, detail="Too many concurrent runs")
     try:
         # Create agent loop with new parameters
         agent_loop = AgentLoop(
@@ -71,14 +89,21 @@ async def chat(request: ChatRequest) -> ChatResponse:
             tool_registry=tool_registry,
             max_steps=request.max_steps,
             max_token_budget=request.max_token_budget,
-            allowed_tools=request.allowed_tools
+            allowed_tools=[name for name in http_request.state.allowed_tools
+                           if request.allowed_tools is None or name in request.allowed_tools],
+            max_tool_calls=request.max_tool_calls,
+            max_run_seconds=request.max_run_seconds,
+            max_cost_budget=request.max_cost_budget
         )
         
         # Run the agent
         state = await agent_loop.run(request.message)
         
         # Store run state
-        runs[state.run_id] = state.to_dict()
+        runs[state.run_id] = {**state.to_dict(), "owner_id": http_request.state.user_id,
+                              "input": request.message, "status": "failed" if state.error else "finished",
+                              "provider": getattr(getattr(llm_client, "config", None), "provider", "test"),
+                              "configuration": request.model_dump()}
         
         # Return response
         if state.error:
@@ -101,12 +126,18 @@ async def chat(request: ChatRequest) -> ChatResponse:
             termination_reason=state.termination_reason
         )
         
+    except HTTPException:
+        raise
+    except OverflowError:
+        raise HTTPException(status_code=503, detail="Run storage capacity reached")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        release_run_slot()
 
 
 @router.get("/trace/{run_id}")
-async def get_trace(run_id: str) -> Dict:
+async def get_trace(run_id: str, request: Request) -> Dict:
     """
     Get the execution trace for a specific run.
     
@@ -116,10 +147,15 @@ async def get_trace(run_id: str) -> Dict:
     Returns:
         Dictionary with full execution trace
     """
-    if run_id not in runs:
+    if run_id not in runs or runs[run_id].get("owner_id") != request.state.user_id:
         raise HTTPException(status_code=404, detail="Run not found")
     
     return runs[run_id]
+
+
+@router.get("/metrics")
+async def get_metrics() -> Dict:
+    return metrics.snapshot()
 
 
 @router.get("/health")
@@ -134,7 +170,7 @@ async def health_check() -> Dict[str, str]:
 
 
 @router.get("/replay/{run_id}")
-async def replay_run(run_id: str) -> Dict:
+async def replay_run(run_id: str, request: Request) -> Dict:
     """
     Replay a previous agent execution.
     
@@ -144,6 +180,8 @@ async def replay_run(run_id: str) -> Dict:
     Returns:
         Dictionary with replay results
     """
+    if run_id in runs and runs[run_id].get("owner_id") != request.state.user_id:
+        raise HTTPException(status_code=404, detail="Run not found")
     try:
         replay_result = replay(run_id)
         return {
@@ -157,7 +195,7 @@ async def replay_run(run_id: str) -> Dict:
 
 
 @router.get("/replay/{run_id}/analysis")
-async def replay_with_analysis_endpoint(run_id: str) -> Dict:
+async def replay_with_analysis_endpoint(run_id: str, request: Request) -> Dict:
     """
     Replay a run and provide detailed analysis.
     
@@ -167,6 +205,8 @@ async def replay_with_analysis_endpoint(run_id: str) -> Dict:
     Returns:
         Dictionary with replay results and detailed analysis
     """
+    if run_id in runs and runs[run_id].get("owner_id") != request.state.user_id:
+        raise HTTPException(status_code=404, detail="Run not found")
     try:
         analysis = replay_with_analysis(run_id)
         return analysis

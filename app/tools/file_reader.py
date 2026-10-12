@@ -49,15 +49,19 @@ class FileReader(BaseTool):
             "properties": {
                 "file_path": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
                     "description": "Path to the file to read, relative to the workspace root"
                 },
                 "encoding": {
                     "type": "string",
+                    "enum": ["utf-8", "utf-8-sig"],
                     "default": "utf-8",
                     "description": "File encoding (default: utf-8)"
                 }
             },
-            "required": ["file_path"]
+            "required": ["file_path"],
+            "additionalProperties": False
         }
 
     def _resolve(self, file_path: str) -> tuple[Optional[Path], Optional[str]]:

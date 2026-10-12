@@ -1,7 +1,7 @@
 """
-Provider-agnostic LLM wrapper supporting OpenAI, Groq, and Gemini APIs with token and cost tracking.
+Provider adapters for OpenAI, Groq, and Gemini with normalized agent responses.
 """
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Protocol
 import httpx
 import os
 import time
@@ -9,29 +9,22 @@ import json
 from app.schemas.messages import Message
 
 
-# Cost estimation per 1K tokens
 COST_PER_1K_INPUT_OPENAI = 0.03
 COST_PER_1K_OUTPUT_OPENAI = 0.06
-COST_PER_1K_INPUT_GROQ = 0.00059  # Groq Llama3 pricing
+COST_PER_1K_INPUT_GROQ = 0.00059
 COST_PER_1K_OUTPUT_GROQ = 0.00079
-COST_PER_1K_INPUT_GEMINI = 0.000125  # Gemini 1.5 Flash pricing
+COST_PER_1K_INPUT_GEMINI = 0.000125
 COST_PER_1K_OUTPUT_GEMINI = 0.000375
 
 
 class LLMConfig:
-    """
-    Configuration for LLM provider selection and settings.
-    
-    Design decision: Centralize all provider-specific configuration in this class
-    to avoid scattering provider logic across the codebase.
-    """
     provider: Literal["openai", "groq", "gemini"]
     api_key: str
     base_url: str
     model: str
     temperature: float
     max_tokens: int
-    
+
     def __init__(
         self,
         provider: Literal["openai", "groq", "gemini"] = "openai",
@@ -45,7 +38,6 @@ class LLMConfig:
             raise ValueError(f"Unsupported LLM provider: {provider!r}")
         self.provider = provider
 
-        # Provider-specific defaults
         if provider == "groq":
             self.base_url = base_url or "https://api.groq.com/openai/v1"
             self.model = model or "llama-3.1-8b-instant"
@@ -54,40 +46,29 @@ class LLMConfig:
             self.base_url = base_url or "https://generativelanguage.googleapis.com/v1beta"
             self.model = model or "gemini-pro"
             self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        else:  # openai
+        else:
             self.base_url = base_url or "https://api.openai.com/v1"
             self.model = model or "gpt-4"
             self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        
+
         self.temperature = temperature
         self.max_tokens = max_tokens
 
 
 def extract_json_block(text: str) -> str:
-    """
-    Extract JSON block from text, handling extra text before/after JSON.
-    
-    This is useful for providers like Groq that may return extra text
-    around JSON responses.
-    """
     if not text:
         return text
-    
-    # Try to find JSON-like content
-    # First, try to find content between { and }
+
     start = text.find("{")
     end = text.rfind("}")
-    
     if start != -1 and end != -1 and end > start:
-        json_text = text[start:end+1]
-        # Try to parse it to see if it's valid
+        json_text = text[start:end + 1]
         try:
             json.loads(json_text)
             return json_text
         except json.JSONDecodeError:
             pass
-    
-    # If that fails, try to find content between ```json and ```
+
     if "```json" in text:
         start = text.find("```json") + 7
         end = text.find("```", start)
@@ -98,8 +79,7 @@ def extract_json_block(text: str) -> str:
                 return json_text
             except json.JSONDecodeError:
                 pass
-    
-    # If that fails, try to find content between ``` and ```
+
     if "```" in text:
         start = text.find("```") + 3
         end = text.find("```", start)
@@ -110,70 +90,113 @@ def extract_json_block(text: str) -> str:
                 return json_text
             except json.JSONDecodeError:
                 pass
-    
-    # Return original text if no valid JSON found
+
     return text
 
 
 def estimate_tokens(text: str) -> int:
-    """
-    Estimate token count using simple heuristic (len(text)/4).
-    
-    Used for providers like Groq that may not consistently return
-    token usage in their API responses.
-    
-    Args:
-        text: Text to estimate tokens for
-        
-    Returns:
-        Estimated token count
-    """
     return max(1, len(text) // 4)
 
 
-class LLMClient:
-    """
-    Provider-agnostic client for interacting with LLM APIs.
-    
-    Supports OpenAI and Groq through a unified interface.
-    All provider-specific logic is isolated in this layer.
-    """
-    
-    def __init__(self, config: LLMConfig):
-        """
-        Initialize LLM client with configuration.
-        
-        Args:
-            config: LLMConfig object with provider settings
-        """
+class LLMHTTPError(Exception):
+    def __init__(
+        self,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        transient: bool | None = None,
+    ):
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.transient = (
+            status_code in (408, 409, 425, 429) or
+            (status_code is not None and status_code >= 500)
+        ) if transient is None else transient
+        super().__init__(
+            f"LLM API error: HTTP {status_code}"
+            if status_code is not None else "LLM API transport error"
+        )
+
+
+class LLMProvider(Protocol):
+    @property
+    def capabilities(self) -> Dict[str, bool]: ...
+
+    async def send_messages(
+        self, messages: List[Message], tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        json_mode: bool = True, max_retries: int = 2
+    ) -> tuple[str, Optional[Dict[str, Any]]]: ...
+
+    async def close(self) -> None: ...
+
+
+def _raise_http_error(exc: httpx.HTTPError) -> None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        retry_after = exc.response.headers.get("retry-after")
+        try:
+            parsed_retry_after = float(retry_after) if retry_after else None
+        except ValueError:
+            parsed_retry_after = None
+        raise LLMHTTPError(exc.response.status_code, parsed_retry_after) from exc
+    raise LLMHTTPError(transient=True) from exc
+
+
+def _usage_metadata(
+    provider: str,
+    model: str,
+    latency_ms: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    estimated_cost: float,
+) -> Dict[str, Any]:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "latency_ms": latency_ms,
+        "estimated_cost": estimated_cost,
+        "provider": provider,
+        "model": model,
+    }
+
+
+class OpenAICompatibleProvider:
+    native_tool_calls = False
+    enforced_json_mode = False
+    input_cost = COST_PER_1K_INPUT_OPENAI
+    output_cost = COST_PER_1K_OUTPUT_OPENAI
+
+    def __init__(self, config: LLMConfig, client: httpx.AsyncClient):
         self.config = config
-        self.client = httpx.AsyncClient(timeout=60.0)
-    
-    async def _send_openai_compatible(
+        self.client = client
+
+    @property
+    def capabilities(self) -> Dict[str, bool]:
+        return {
+            "native_tool_calls": self.native_tool_calls,
+            "json_mode": self.enforced_json_mode,
+        }
+
+    async def send_messages(
         self,
         messages: List[Message],
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
-        json_mode: bool = True
+        json_mode: bool = True,
+        max_retries: int = 2,
     ) -> tuple[str, Dict[str, Any]]:
-        """Send request to OpenAI-compatible API (OpenAI, Groq)."""
         start_time = time.time()
-        
-        # Convert messages to API format
         api_messages = [
             {"role": msg.role, "content": msg.content}
             for msg in messages
         ]
-        
-        # Build request payload
         payload = {
             "model": self.config.model,
             "messages": api_messages,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens
         }
-        
-        # Add tool schemas if provided (Groq may not support function calling)
-        if tool_schemas and self.config.provider == "openai":
+
+        if tool_schemas and self.native_tool_calls:
             payload["tools"] = [
                 {
                     "type": "function",
@@ -185,103 +208,109 @@ class LLMClient:
                 }
                 for schema in tool_schemas
             ]
-        
-        # Enforce JSON mode if requested (note: Groq may not support response_format)
-        if json_mode and self.config.provider == "openai":
+
+        if json_mode and self.enforced_json_mode:
             payload["response_format"] = {"type": "json_object"}
-        
-        # Make API request
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json"
-        }
-        
+
         try:
             response = await self.client.post(
                 f"{self.config.base_url}/chat/completions",
                 json=payload,
-                headers=headers
+                headers={
+                    "Authorization": f"Bearer {self.config.api_key}",
+                    "Content-Type": "application/json"
+                }
             )
-
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as e:
-            raise Exception(f"LLM API error: {str(e)}")
-        except KeyError as e:
-            raise Exception(f"Invalid LLM response format: {str(e)}")
-        
-        # Calculate latency
+            _raise_http_error(e)
+
         latency_ms = (time.time() - start_time) * 1000
-        
-        # Extract response text
-        content = data["choices"][0]["message"]["content"]
-        
-        # For Groq, extract JSON block if in JSON mode
-        if json_mode and self.config.provider == "groq":
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError("Invalid LLM response format") from e
+
+        native_calls = message.get("tool_calls") or []
+        if native_calls:
+            if len(native_calls) != 1 or native_calls[0].get("type") != "function":
+                raise ValueError("Only one native function call per model step is supported")
+            function = native_calls[0]["function"]
+            arguments = json.loads(function["arguments"])
+            if not isinstance(arguments, dict):
+                raise ValueError("Native function arguments must be an object")
+            content = json.dumps({
+                "type": "action",
+                "tool_name": function["name"],
+                "arguments": arguments,
+            })
+        else:
+            content = message.get("content")
+            if not isinstance(content, str):
+                raise ValueError("Provider returned neither text nor a supported function call")
+
+        if json_mode and not self.enforced_json_mode:
             content = extract_json_block(content)
-        
-        # Extract token usage and calculate cost
+
         token_usage = data.get("usage", {})
         prompt_tokens = token_usage.get("prompt_tokens", 0)
         completion_tokens = token_usage.get("completion_tokens", 0)
         total_tokens = token_usage.get("total_tokens", 0)
-        
-        # Estimate tokens if provider doesn't return usage (Groq inconsistency)
         if total_tokens == 0:
-            input_text = " ".join([msg.content for msg in messages])
+            input_text = " ".join(str(msg.content) for msg in messages)
             prompt_tokens = estimate_tokens(input_text)
             completion_tokens = estimate_tokens(content)
             total_tokens = prompt_tokens + completion_tokens
-        
-        # Calculate cost based on provider
-        if self.config.provider == "groq":
-            estimated_cost = (
-                (prompt_tokens / 1000) * COST_PER_1K_INPUT_GROQ +
-                (completion_tokens / 1000) * COST_PER_1K_OUTPUT_GROQ
-            )
-        else:
-            estimated_cost = (
-                (prompt_tokens / 1000) * COST_PER_1K_INPUT_OPENAI +
-                (completion_tokens / 1000) * COST_PER_1K_OUTPUT_OPENAI
-            )
-        
-        metadata = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "latency_ms": latency_ms,
-            "estimated_cost": estimated_cost,
-            "provider": self.config.provider,
-            "model": self.config.model
-        }
-        
-        return content, metadata
-    
-    async def _send_gemini(
+
+        estimated_cost = (
+            (prompt_tokens / 1000) * self.input_cost +
+            (completion_tokens / 1000) * self.output_cost
+        )
+        return content, _usage_metadata(
+            self.config.provider, self.config.model, latency_ms,
+            prompt_tokens, completion_tokens, total_tokens, estimated_cost,
+        )
+
+
+class OpenAIProvider(OpenAICompatibleProvider):
+    native_tool_calls = True
+    enforced_json_mode = True
+
+
+class GroqProvider(OpenAICompatibleProvider):
+    input_cost = COST_PER_1K_INPUT_GROQ
+    output_cost = COST_PER_1K_OUTPUT_GROQ
+
+
+class GeminiProvider:
+    def __init__(self, config: LLMConfig, client: httpx.AsyncClient):
+        self.config = config
+        self.client = client
+
+    @property
+    def capabilities(self) -> Dict[str, bool]:
+        return {"native_tool_calls": False, "json_mode": False}
+
+    async def send_messages(
         self,
         messages: List[Message],
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
-        json_mode: bool = True
+        json_mode: bool = True,
+        max_retries: int = 2,
     ) -> tuple[str, Dict[str, Any]]:
-        """Send request to Gemini API."""
         start_time = time.time()
-
-        # Convert messages to Gemini format. Gemini does not accept a
-        # "system" role in contents — system instructions go in the
-        # dedicated system_instruction field instead.
         contents = []
         system_texts = []
         for msg in messages:
             if msg.role == "system":
-                system_texts.append(msg.content)
+                system_texts.append(str(msg.content))
                 continue
-            role = "user" if msg.role == "user" else "model"
             contents.append({
-                "role": role,
-                "parts": [{"text": msg.content}]
+                "role": "user" if msg.role == "user" else "model",
+                "parts": [{"text": str(msg.content)}]
             })
 
-        # Build request payload
         payload = {
             "contents": contents,
             "generationConfig": {
@@ -293,61 +322,64 @@ class LLMClient:
             payload["system_instruction"] = {
                 "parts": [{"text": "\n\n".join(system_texts)}]
             }
-        
-        # Make API request — the key goes in a header, never in the URL,
-        # so it cannot leak via URLs embedded in logs or error messages.
-        url = f"{self.config.base_url}/models/{self.config.model}:generateContent"
-        headers = {
-            "x-goog-api-key": self.config.api_key,
-            "Content-Type": "application/json",
-        }
 
         try:
-            response = await self.client.post(url, json=payload, headers=headers)
+            response = await self.client.post(
+                f"{self.config.base_url}/models/{self.config.model}:generateContent",
+                json=payload,
+                headers={
+                    "x-goog-api-key": self.config.api_key,
+                    "Content-Type": "application/json",
+                },
+            )
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as e:
-            raise Exception(f"LLM API error: {str(e)}")
-        except KeyError as e:
-            raise Exception(f"Invalid LLM response format: {str(e)}")
-        
-        # Calculate latency
+            _raise_http_error(e)
+
         latency_ms = (time.time() - start_time) * 1000
-        
-        # Extract response text
-        content = data["candidates"][0]["content"]["parts"][0]["text"]
-        
-        # Extract token usage
+        try:
+            content = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError("Invalid LLM response format") from e
+        if not isinstance(content, str):
+            raise ValueError("Provider returned non-text content")
+
         usage_metadata = data.get("usageMetadata", {})
         prompt_tokens = usage_metadata.get("promptTokenCount", 0)
         completion_tokens = usage_metadata.get("candidatesTokenCount", 0)
         total_tokens = usage_metadata.get("totalTokenCount", prompt_tokens + completion_tokens)
-        
-        # Estimate tokens if not provided
         if total_tokens == 0:
-            input_text = " ".join([msg.content for msg in messages])
+            input_text = " ".join(str(msg.content) for msg in messages)
             prompt_tokens = estimate_tokens(input_text)
             completion_tokens = estimate_tokens(content)
             total_tokens = prompt_tokens + completion_tokens
-        
-        # Calculate cost
+
         estimated_cost = (
             (prompt_tokens / 1000) * COST_PER_1K_INPUT_GEMINI +
             (completion_tokens / 1000) * COST_PER_1K_OUTPUT_GEMINI
         )
-        
-        metadata = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "latency_ms": latency_ms,
-            "estimated_cost": estimated_cost,
-            "provider": self.config.provider,
-            "model": self.config.model
-        }
-        
-        return content, metadata
-    
+        return content, _usage_metadata(
+            "gemini", self.config.model, latency_ms,
+            prompt_tokens, completion_tokens, total_tokens, estimated_cost,
+        )
+
+
+class LLMClient:
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.client = httpx.AsyncClient(timeout=60.0)
+        adapter = {
+            "openai": OpenAIProvider,
+            "groq": GroqProvider,
+            "gemini": GeminiProvider,
+        }[config.provider]
+        self.provider = adapter(config, self.client)
+
+    @property
+    def capabilities(self) -> Dict[str, bool]:
+        return self.provider.capabilities
+
     async def send_messages(
         self,
         messages: List[Message],
@@ -355,35 +387,14 @@ class LLMClient:
         json_mode: bool = True,
         max_retries: int = 2
     ) -> tuple[str, Optional[Dict[str, Any]]]:
-        """
-        Send messages to the LLM and get response with latency and cost tracking.
-        
-        Args:
-            messages: List of Message objects
-            tool_schemas: Optional list of tool schemas to include
-            json_mode: Whether to enforce JSON output
-            max_retries: Maximum retry attempts for parsing failures
-            
-        Returns:
-            Tuple of (response_text, metadata) where metadata includes:
-            - prompt_tokens: Input tokens
-            - completion_tokens: Output tokens
-            - total_tokens: Total tokens
-            - latency_ms: Request latency in milliseconds
-            - estimated_cost: Estimated cost in USD
-            - provider: Provider name
-            - model: Model name
-        """
         if not self.config.api_key:
             raise Exception(
                 f"No API key configured for provider '{self.config.provider}'"
             )
+        return await self.provider.send_messages(
+            messages, tool_schemas=tool_schemas,
+            json_mode=json_mode, max_retries=max_retries,
+        )
 
-        if self.config.provider == "gemini":
-            return await self._send_gemini(messages, tool_schemas, json_mode)
-        else:
-            return await self._send_openai_compatible(messages, tool_schemas, json_mode)
-    
     async def close(self) -> None:
-        """Close the HTTP client."""
         await self.client.aclose()

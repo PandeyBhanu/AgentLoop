@@ -26,14 +26,22 @@ class Calculator(BaseTool):
                 },
                 "a": {
                     "type": "number",
+                    "minimum": -1000000,
+                    "maximum": 1000000,
                     "description": "First operand (or the number for factorial)"
                 },
                 "b": {
                     "type": "number",
+                    "minimum": -1000000,
+                    "maximum": 1000000,
                     "description": "Second operand (not required for factorial)"
                 }
             },
-            "required": ["operation", "a"]
+            "required": ["operation", "a"],
+            "additionalProperties": False,
+            "if": {"properties": {"operation": {"const": "factorial"}}, "required": ["operation"]},
+            "then": {"properties": {"a": {"type": "integer", "minimum": 0, "maximum": 1000}}},
+            "else": {"required": ["b"]}
         }
     
     async def execute(self, arguments: Dict[str, Any]) -> Any:
@@ -53,7 +61,7 @@ class Calculator(BaseTool):
         # Handle factorial separately (only needs one operand)
         if operation == "factorial":
             try:
-                result = math.factorial(int(a))
+                result = math.factorial(a)
                 return {"result": result, "operation": operation}
             except Exception as e:
                 return {"error": str(e)}

@@ -1,115 +1,182 @@
-# ReAct Agent Framework
+# AgentLoop
 
-A minimal ReAct agent framework built from scratch in Python — no LangChain, LlamaIndex, or other agent frameworks. Implements the Thought → Action → Observation loop with validated tool calling, guardrails, full execution traces, and replay.
+AgentLoop is a lightweight Python ReAct-style agent framework built from scratch. It implements a `Thought -> Action -> Observation` loop with strict JSON parsing, tool validation, guardrails, tracing, replay, and SSE streaming. The project is intentionally framework-free: there is no LangChain, no LlamaIndex, and no hidden orchestration layer.
+
+The current codebase contains the core agent runtime, a FastAPI API, a React frontend, SQLite-backed run persistence, and a small tool system for arithmetic, web search, file reads, and optionally isolated Python execution.
+
+## What the project does
+
+AgentLoop can:
+
+- accept a user request and reason through multiple steps using an LLM
+- restrict tool use based on server-side policies and per-request `allowed_tools`
+- validate tool inputs against JSON Schema before execution
+- stream progress events while a run is in flight
+- persist full run traces and replay them after completion
+- enforce guardrails such as max-step limits, token budgets, cost budgets, timeouts, and repeated-thought/tool loops
+- expose a simple browser UI for chatting with the agent
+
+## Current implementation
+
+The implementation is organized like this:
+
+```text
+app/
+  agent/
+    loop.py          # ReAct execution loop and run lifecycle
+    parser.py        # strict JSON parser with repair logic
+    state.py         # agent state and termination reasons
+    guardrails.py    # step limits, loop detection, timeouts
+    memory.py        # conversation memory
+    replay.py        # run replay and analysis helpers
+  api/
+    routes.py        # FastAPI endpoints for chat, trace, replay, health, metrics
+    sse.py           # SSE stream manager and live run subscribers
+  tools/
+    base.py          # base tool contract
+    registry.py      # tool registration and lookup
+    calculator.py    # arithmetic tool
+    web_search.py    # configurable SearXNG-compatible search tool
+    file_reader.py   # workspace-jail file reader
+    python_exec.py   # optional isolated Python executor
+  schemas/
+    messages.py      # request/response schema models
+    tools.py         # tool parameter validation helpers
+  llm.py             # provider adapters for OpenAI, Groq, and Gemini
+  storage.py         # SQLite-backed run store
+  utils/
+    logger.py        # metrics and logging helpers
+frontend/            # React + Vite UI for interacting with the API
+main.py              # FastAPI app entry point and auth middleware
+tests/               # deterministic regression and security tests
+```
+
+## Core runtime behavior
+
+The runtime is built around `AgentLoop` and `AgentState`:
+
+- each run starts with a `system` message and a `user` message
+- the model emits either `thought`, `action`, or `finish`
+- `action` calls are checked in a fixed order: tool exists, tool is allowed, schema is valid, fingerprint is not a repeated loop, then tool executes
+- every step is recorded in a structured trace with token/cost/latency metadata
+- a run terminates with a defined reason such as `completed`, `error`, `max_steps`, `budget_exceeded`, `cost_exceeded`, `run_timeout`, or `loop_detected`
+
+The project also intentionally preserves runtime observability via stored traces, replay, and metrics snapshots.
 
 ## Features
 
-- **ReAct Pattern**: Thought → Action → Observation loop with explicit state machine and termination reasons
-- **Tool System**: Registry with JSON Schema argument validation, per-run `allowed_tools` authorization, and execution timeouts
-- **Guardrails**: Repeated-tool-call and repeated-thought detection, step limits, token budgets
-- **Trace Logging**: Complete execution trace with timestamps, latency, and token usage
-- **Replay**: Re-run analysis of completed executions with latency statistics
-- **SSE Streaming**: Replays a completed run's trace as Server-Sent Events
-- **Structured Errors**: Typed error entries (`tool_execution`, `parsing`, `llm`, `guardrail`, `timeout`) that don't corrupt agent state
-- **Async Design**: Fully async/await throughout
-- **Type Safety**: Pydantic v2 models with full type hints
-
-See `AGENT_LOOP.md` for the state-machine diagram, transition invariants, and termination semantics.
-
-## Project Structure
-
-```
-/app
-  /agent
-    loop.py          # Core ReAct agent loop
-    parser.py        # LLM response parser (strict JSON + repair)
-    state.py         # Agent state, trace entries, termination reasons
-    guardrails.py    # Step limits, loop detection, timeouts
-    memory.py        # Conversation memory
-    replay.py        # Run replay and analysis
-  /tools
-    base.py          # Base tool class
-    registry.py      # Tool registry
-    calculator.py    # Calculator tool
-    web_search.py    # Web search tool (mock)
-    file_reader.py   # File reader (workspace-jailed)
-    python_exec.py   # Python executor (disabled by default)
-  /api
-    routes.py        # FastAPI routes
-    sse.py           # Server-Sent Events streaming
-  /schemas
-    messages.py      # Message and response schemas
-    tools.py         # Tool validation schemas
-  llm.py             # Multi-provider LLM client (OpenAI/Groq/Gemini)
-  storage.py         # In-memory run store
-main.py              # FastAPI app entry point
-/frontend            # React 18 + Vite + TailwindCSS UI
-/tests               # pytest suite (~210 tests)
-```
+- ReAct agent loop with explicit state transitions
+- JSON schema validation for tool arguments
+- Tool allowlists and per-user API-key policies
+- Guardrails for repeated tool/thought loops, step caps, token caps, and max runtime
+- Full run traces stored in SQLite and replayable after completion
+- Live event streaming through SSE for active runs
+- Async LLM provider support across OpenAI, Groq, and Gemini
+- Server-side CORS protection and loopback-only development mode
+- Optional Python execution runner that is disabled by default and isolated behind a separate worker image
 
 ## Installation
 
+Create a Python environment and install the project dependencies:
+
 ```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-pip install -r requirements-dev.txt   # for running tests
+pip install -r requirements-dev.txt
 ```
+
+The repo also includes a Docker setup for the API and optional worker image.
 
 ## Configuration
 
-All configuration is via environment variables (loaded from `.env`):
+Configuration is loaded from environment variables through `.env` files and the process environment.
 
 | Variable | Default | Description |
 |---|---|---|
 | `LLM_PROVIDER` | `openai` | `openai`, `groq`, or `gemini` |
-| `OPENAI_API_KEY` | — | Required when provider is `openai` |
-| `GROQ_API_KEY` | — | Required when provider is `groq` |
-| `GEMINI_API_KEY` | — | Required when provider is `gemini` |
-| `AGENTLOOP_API_KEY` | unset | If set, all endpoints except `/` and `/api/health` require the `X-API-Key` header |
-| `AGENTLOOP_ENABLE_PYTHON_EXEC` | unset | Set to `1` to enable the PythonExec tool (see Security Notes) |
-| `CORS_ORIGINS` | `localhost:3000` origins | Comma-separated allowed origins |
-| `HOST` / `PORT` | `127.0.0.1` / `8000` | Server bind address |
+| `OPENAI_API_KEY` | unset | API key for OpenAI |
+| `GROQ_API_KEY` | unset | API key for Groq |
+| `GEMINI_API_KEY` | unset | API key for Gemini |
+| `AGENTLOOP_MODE` | `development` | `production` requires configured API keys |
+| `AGENTLOOP_API_KEY` | unset | Shared API key for single-key mode |
+| `AGENTLOOP_USERS_JSON` | unset | Mapping of user name to `{ "api_key": "...", "allowed_tools": [...] }` |
+| `AGENTLOOP_ALLOWED_TOOLS` | `Calculator,WebSearch,FileReader` | Default server-side tool policy |
+| `AGENTLOOP_DB_PATH` | `.agentloop/runs.sqlite3` | SQLite DB path for runs |
+| `AGENTLOOP_MAX_ACTIVE_RUNS` | `20` | Max concurrently active runs |
+| `SEARCH_PROVIDER` | unset | e.g. `searxng` |
+| `SEARCH_BASE_URL` | unset | Base URL for the configured search service |
+| `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Allowed origins |
+| `HOST` | `127.0.0.1` | API bind host |
+| `PORT` | `8000` | API bind port |
+| `FILE_READER_ROOT` | current working directory | Root directory for `FileReader` |
+| `AGENTLOOP_ENABLE_PYTHON_EXEC` | unset | Enables optional Python execution path |
 
-Defaults per provider: OpenAI `gpt-4`, Groq `llama-3.1-8b-instant`, Gemini `gemini-pro`.
+Example `.env`:
 
-## Running
-
-Backend:
-
-```bash
-python main.py    # http://127.0.0.1:8000
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_key_here
+AGENTLOOP_MODE=development
+AGENTLOOP_ALLOWED_TOOLS=Calculator,WebSearch,FileReader
+SEARCH_PROVIDER=searxng
+SEARCH_BASE_URL=https://search.example.com
+CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-Frontend:
+## Running the project
+
+Start the backend:
 
 ```bash
-cd frontend && npm install && npm run dev
+python main.py
 ```
 
-## API Endpoints
+The API runs at `http://127.0.0.1:8000`.
 
-### POST /api/chat
+Start the frontend:
 
-Process a user message through the agent loop.
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-**Request:**
+Run the API via Docker:
+
+```bash
+docker build -t agentloop-api:local .
+docker compose up --build -d
+curl http://127.0.0.1:8000/api/health
+```
+
+The Compose setup keeps SQLite on a named volume and runs the API in a non-root container. Python execution is intentionally disabled in the standard Compose API service; it requires a separate host-side worker setup.
+
+## API overview
+
+### `POST /api/chat`
+
+Starts a synchronous run and returns the final result.
+
+Request body:
+
 ```json
 {
   "message": "What is 15 * 7?",
   "max_steps": 10,
   "allowed_tools": ["Calculator"],
-  "max_token_budget": 50000
+  "max_token_budget": 50000,
+  "max_tool_calls": 20,
+  "max_run_seconds": 120,
+  "max_cost_budget": 0.05
 }
 ```
 
-- `message` (required): 1–20,000 chars
-- `max_steps`: 1–50, default 10
-- `allowed_tools`: optional whitelist; omit to allow all registered tools
-- `max_token_budget`: optional cap; run terminates with `budget_exceeded` when exceeded
+Response includes:
 
-**Response:**
 ```json
 {
-  "run_id": "uuid-here",
+  "run_id": "uuid",
   "final_answer": "The answer is 105",
   "steps": 2,
   "total_tokens": 842,
@@ -119,74 +186,87 @@ Process a user message through the agent loop.
 }
 ```
 
-`termination_reason` is one of `completed`, `error`, `max_steps`, `budget_exceeded`, `loop_detected`.
+### `GET /api/trace/{run_id}`
 
-### GET /api/trace/{run_id}
+Returns the full trace for a stored run.
 
-Full execution trace for a run: conversation history, trace entries (thought/action/observation/error), step count, token usage, termination reason. Returns 404 for unknown run IDs.
+### `GET /api/replay/{run_id}`
 
-### GET /api/replay/{run_id}
+Replays a stored run and returns `success`, `steps`, `final_answer`, and `error`.
 
-Replays a stored run's trace. Returns `success`, `steps`, `final_answer`, `error`.
+### `GET /api/replay/{run_id}/analysis`
 
-### GET /api/replay/{run_id}/analysis
+Returns replay results plus latency statistics, traces, and termination metadata.
 
-Replay plus analysis: per-step latency stats, tool-call counts, trace data, termination reason.
+### `POST /api/runs`
 
-### GET /api/stream/{run_id}
+Creates a background run and returns a `run_id` immediately. Use `GET /api/stream/{run_id}` to subscribe to live step events.
 
-Streams a **completed** run's trace as Server-Sent Events (step, tool_call, metrics, finish). This replays stored results — it is not live execution streaming.
+### `POST /api/runs/{run_id}/cancel`
 
-### GET /api/health
+Requests cancellation of a live run owned by the caller.
 
-Health check. Always open, even when `AGENTLOOP_API_KEY` is set.
+### `GET /api/stream/{run_id}`
 
-## Available Tools
+Streams step, tool, LLM, metrics, and finish events for a run.
 
-1. **Calculator**: Basic arithmetic (add, subtract, multiply, divide)
-2. **WebSearch**: Web search (mock implementation)
-3. **FileReader**: Reads text files, jailed to a workspace root — blocks `..` traversal, absolute-path escapes, symlinks, hidden files (`.env`, `.git`), and files over 1 MB
-4. **PythonExec**: Executes whitelisted Python expressions. **Disabled by default** — set `AGENTLOOP_ENABLE_PYTHON_EXEC=1` to enable. See Security Notes before enabling.
+### `GET /api/metrics`
 
-## Example Usage
+Returns a JSON snapshot of in-memory counters and run metrics.
 
-```bash
-# Chat
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Calculate 25 * 4", "max_steps": 10}'
+### `GET /api/health`
 
-# Stream the completed run's trace
-curl http://localhost:8000/api/stream/<run_id>
+Basic health check endpoint.
 
-# With API key auth enabled
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{"message": "Hello"}'
-```
+## Available tools
+
+1. `Calculator`
+   - basic arithmetic operations
+2. `WebSearch`
+   - configured search provider via `SEARCH_PROVIDER` and `SEARCH_BASE_URL`
+   - intentionally fails cleanly when not configured rather than fabricating results
+3. `FileReader`
+   - reads text files inside a configured workspace root
+   - blocks traversal outside the root, hidden files/directories, symlinks, and unsupported binary types
+4. `PythonExec`
+   - disabled by default
+   - available only when explicitly enabled and when the environment supports an isolated worker image
+
+## Security model
+
+The project includes several protections:
+
+- `FileReader` enforces workspace containment and blocks `..`, absolute escapes, hidden paths, and large files
+- `WebSearch` validates result URLs and rejects unsafe or non-global hosts
+- API auth is enforced in production and loopback-only access is allowed in development when no credentials are configured
+- tool execution is gated by allowlists and JSON Schema validation
+- Python execution is not performed in-process by default; it runs through an isolated worker if enabled
+- CORS is restricted to an explicit allowlist rather than `*`
 
 ## Testing
 
+The project includes regression, API, parser, storage, security, and tool tests.
+
 ```bash
-python -m pytest tests/ -q                                              # full suite
-python -m pytest tests/ -q --cov=app --cov=main --cov-report=term-missing # with coverage
-python -m pytest tests/test_security.py -q                              # security tests only
+python -m pytest tests/ -q
+python -m pytest tests/ -q --cov=app --cov=main --cov-report=term-missing
+python -m pytest tests/test_security.py -q
 ```
 
-The suite (~210 tests, ~92% coverage) uses a scripted mock LLM and mocked httpx — it never calls real LLM APIs. Covers parser, tools/registry, guardrails, agent loop, API/SSE/replay, provider-specific message assembly, and security regressions.
+The suite uses mocked LLM/provider responses and includes checks for SSE streaming, cancellation, replay, persistence, and security boundaries. Docker-dependent behavior is skipped when Docker is not available.
 
-## Security Notes
+## Design principles
 
-- **PythonExec is not a sandbox.** Even with its AST whitelist, it runs in-process. Keep it disabled for untrusted input; move execution to a subprocess/container if you need real isolation.
-- **FileReader** is jailed to its workspace but prompt injection can steer reads anywhere *inside* it.
-- **Auth is opt-in** — without `AGENTLOOP_API_KEY`, trace/replay endpoints expose full run contents to anyone with a run_id.
-- **Run storage is unbounded in-memory** — restarts clear it; there's no persistence or eviction.
-- CORS uses an explicit origin allowlist with credentials disabled; `max_steps` and message length are bounded at the schema level.
+- no framework lock-in
+- explicit state transitions instead of hidden orchestration
+- modular runtime boundaries between agent, tools, API, and storage
+- replayability and traceability as first-class features
+- safe tool execution through validation and hard limits
 
-## Design Principles
+## Related notes
 
-- **No Frameworks**: Built without LangChain, LlamaIndex, or similar
-- **Modular**: Clean separation of concerns with minimal coupling
-- **Debuggable**: Full trace logging and replayable runs
-- **Extensible**: Register new tools via `ToolRegistry` with a JSON Schema
+For deeper implementation details, see:
+
+- `decisions.md` for the state machine and design notes
+- `AGENT_LOOP.md` for the formal loop semantics and invariant checks
+- `SECURITY_FIXES.md` and `TECHNICAL_AUDIT.md` for security and implementation follow-up notes

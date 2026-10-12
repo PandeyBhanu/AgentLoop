@@ -6,7 +6,13 @@ interactions go through ScriptedLLM, a deterministic stand-in for
 app.llm.LLMClient.
 """
 import json
+import os
+import tempfile
+import uuid
+from pathlib import Path
 import pytest
+
+os.environ["AGENTLOOP_DB_PATH"] = str(Path(tempfile.mkdtemp(prefix="agentloop-tests-")) / "runs.sqlite3")
 
 from app.tools.registry import ToolRegistry
 from app.tools.calculator import Calculator
@@ -98,6 +104,6 @@ def clean_runs():
     """Isolate the global run store between tests."""
     from app.storage import runs
 
-    runs.clear()
+    runs.use_namespace(str(uuid.uuid4()))
     yield
-    runs.clear()
+    runs.use_namespace(str(uuid.uuid4()))

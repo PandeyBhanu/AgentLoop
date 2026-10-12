@@ -9,6 +9,7 @@ import asyncio
 import pytest
 
 from app.agent.loop import AgentLoop
+from app.llm import LLMHTTPError
 from app.tools.base import BaseTool
 from app.tools.calculator import Calculator
 from app.tools.registry import ToolRegistry
@@ -241,7 +242,7 @@ class TestErrorPaths:
 
         assert state.is_finished
         errors = [e for e in state.trace if e.type == "error"]
-        assert errors and "tool exploded" in errors[0].content
+        assert errors and "RuntimeError" in errors[0].content
         assert errors[0].error_details["stage"] == "tool_execution"
         assert errors[0].error_details["recoverable"] is True
 
@@ -287,6 +288,14 @@ class TestErrorPaths:
         assert state.is_finished
         assert state.error is not None
         assert len(llm.calls) == 3
+
+    async def test_nontransient_provider_error_is_not_retried(self):
+        loop, llm = make_loop([LLMHTTPError(400)])
+        state = await loop.run("go")
+
+        assert state.is_finished
+        assert state.error is not None
+        assert len(llm.calls) == 1
 
     async def test_invalid_llm_json_then_recovery(self):
         # _call_llm_with_retry retries on invalid JSON (3 identical attempts),
@@ -367,6 +376,45 @@ class TestTermination:
         assert state.is_finished
         assert "loop" in state.error.lower()
         assert state.termination_reason == "loop_detected"
+
+    async def test_tool_call_budget(self):
+        loop, _ = make_loop([
+            action_response("Calculator", {"operation": "add", "a": 1, "b": 1}),
+            action_response("Calculator", {"operation": "add", "a": 2, "b": 2}),
+            finish_response("unreachable"),
+        ], max_tool_calls=1)
+        state = await loop.run("go")
+        assert state.termination_reason == "max_tool_calls"
+        assert state.tool_calls == 1
+        assert len([e for e in state.trace if e.type == "observation"]) == 1
+
+    async def test_wall_clock_limit_while_waiting_on_llm(self):
+        class WaitingLLM:
+            async def send_messages(self, **kwargs):
+                await asyncio.sleep(5)
+                return finish_response("too late"), make_metadata()
+
+        loop = AgentLoop(WaitingLLM(), make_registry(Calculator()), max_run_seconds=0.05)
+        state = await loop.run("go")
+        assert state.termination_reason == "run_timeout"
+        assert state.is_finished
+
+    async def test_cost_budget(self):
+        loop, _ = make_loop([finish_response("unreachable")], max_cost_budget=0.0001)
+        state = await loop.run("go")
+        assert state.termination_reason == "cost_exceeded"
+
+    async def test_task_cancellation_propagates(self):
+        class WaitingLLM:
+            async def send_messages(self, **kwargs):
+                await asyncio.sleep(5)
+
+        loop = AgentLoop(WaitingLLM(), make_registry(Calculator()))
+        task = asyncio.create_task(loop.run("go"))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 # ---------------------------------------------------------------------------

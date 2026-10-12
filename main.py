@@ -13,12 +13,32 @@ from fastapi.responses import JSONResponse
 from app.api.routes import router as routes_router
 from app.api.sse import router as sse_router
 import uvicorn
+import asyncio
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app):
+    from app.storage import runs
+    runs.mark_interrupted_runs()
+    yield
+    from app.api.sse import live_runs
+    from app.api import routes
+    current_loop = asyncio.get_running_loop()
+    active_tasks = [run.task for run in live_runs.values()
+                    if run.task and not run.finished and run.task.get_loop() is current_loop]
+    for task in active_tasks:
+        task.cancel()
+    await asyncio.gather(*active_tasks, return_exceptions=True)
+    if hasattr(routes.llm_client, "close"):
+        await routes.llm_client.close()
 
 
 app = FastAPI(
     title="ReAct Agent API",
-    description="Production-quality minimal ReAct agent framework",
-    version="1.0.0"
+    description="ReAct agent framework",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS — explicit origins only. Never use "*" with credentials.
@@ -39,19 +59,48 @@ app.add_middleware(
 )
 
 
-# Optional shared-secret auth. When AGENTLOOP_API_KEY is set, every request
-# except / and /api/health must carry the matching X-API-Key header.
-# When unset the API is open (dev mode) — set it before exposing the server.
+# API identity and server-side tool policy. Production requires credentials.
+# Without credentials, development mode is limited to loopback/test clients.
 _api_key = os.getenv("AGENTLOOP_API_KEY")
-if _api_key:
+_users = os.getenv("AGENTLOOP_USERS_JSON")
+if _users:
+    import json
+    _identities = json.loads(_users)
+    if not isinstance(_identities, dict) or not all(
+        isinstance(identity, str) and isinstance(config, dict) and
+        isinstance(config.get("api_key"), str) and config["api_key"] and
+        isinstance(config.get("allowed_tools"), list) and
+        all(isinstance(tool, str) for tool in config["allowed_tools"])
+        for identity, config in _identities.items()
+    ) or len({config["api_key"] for config in _identities.values()}) != len(_identities):
+        raise RuntimeError("Invalid AGENTLOOP_USERS_JSON configuration")
+else:
+    _identities = {"default": {"api_key": _api_key, "allowed_tools": [
+        name for name in os.getenv("AGENTLOOP_ALLOWED_TOOLS", "Calculator,WebSearch,FileReader").split(",") if name
+    ]}} if _api_key else {}
+if os.getenv("AGENTLOOP_MODE", "development").lower() == "production" and not _identities:
+    raise RuntimeError("An API key is required in production mode")
 
-    @app.middleware("http")
-    async def api_key_middleware(request, call_next):
-        if request.url.path in ("/", "/api/health") or request.method == "OPTIONS":
-            return await call_next(request)
-        if request.headers.get("x-api-key") != _api_key:
-            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+@app.middleware("http")
+async def api_key_middleware(request, call_next):
+    if request.url.path in ("/", "/api/health") or request.method == "OPTIONS":
         return await call_next(request)
+    key = request.headers.get("x-api-key")
+    if _identities:
+        import hmac
+        user = next((name for name, config in _identities.items()
+                     if key and hmac.compare_digest(key, config["api_key"])), None)
+        if user is None:
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        policy = _identities[user]["allowed_tools"]
+    else:
+        if request.client and request.client.host not in ("127.0.0.1", "::1", "testclient"):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        user = "development"
+        policy = [name for name in os.getenv("AGENTLOOP_ALLOWED_TOOLS", "Calculator,WebSearch,FileReader").split(",") if name]
+    request.state.user_id = user
+    request.state.allowed_tools = policy
+    return await call_next(request)
 
 
 # Include routers

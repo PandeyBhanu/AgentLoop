@@ -2,8 +2,9 @@
 Logging utilities for the agent system with token and cost tracking.
 """
 import logging
+import threading
+from collections import defaultdict, deque
 from typing import Optional
-from datetime import datetime
 
 
 class AgentLogger:
@@ -47,11 +48,11 @@ class AgentLogger:
     
     def log_tool_call(self, tool_name: str, arguments: dict) -> None:
         """Log a tool call."""
-        self.logger.info(f"Tool call: {tool_name} with args {arguments}")
+        self.logger.info("Tool call: %s", tool_name)
     
     def log_observation(self, tool_name: str, result: str) -> None:
         """Log an observation from a tool."""
-        self.logger.info(f"Observation from {tool_name}: {result[:200]}...")
+        self.logger.info("Observation from %s: %d characters", tool_name, len(result))
     
     def log_token_usage(self, step: int, prompt_tokens: int, completion_tokens: int, 
                         total_tokens: int, latency_ms: float, cost: float,
@@ -68,5 +69,41 @@ class AgentLogger:
         self.logger.error(f"[{stage}] {message} (recoverable: {recoverable})")
 
 
-# Global logger instance
+class MetricsRegistry:
+    def __init__(self, max_observations: int = 2048):
+        self._counters = defaultdict(int)
+        self._observations = defaultdict(lambda: deque(maxlen=max_observations))
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(name: str, labels: Optional[dict] = None) -> tuple:
+        return name, tuple(sorted((labels or {}).items()))
+
+    def increment(self, name: str, value: int = 1, labels: Optional[dict] = None) -> None:
+        with self._lock:
+            self._counters[self._key(name, labels)] += value
+
+    def observe(self, name: str, value: float, labels: Optional[dict] = None) -> None:
+        with self._lock:
+            self._observations[self._key(name, labels)].append(float(value))
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            counters = {
+                ".".join([name, *(f"{key}={value}" for key, value in labels)]): count
+                for (name, labels), count in self._counters.items()
+            }
+            observations = {}
+            for (name, labels), values in self._observations.items():
+                data = list(values)
+                if data:
+                    key = ".".join([name, *(f"{k}={v}" for k, v in labels)])
+                    observations[key] = {
+                        "count": len(data), "total": sum(data),
+                        "avg": sum(data) / len(data), "max": max(data),
+                    }
+            return {"counters": counters, "observations": observations}
+
+
 logger = AgentLogger()
+metrics = MetricsRegistry()

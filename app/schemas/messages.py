@@ -3,7 +3,7 @@ Pydantic schemas for agent messages and responses.
 """
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class Message(BaseModel):
@@ -38,7 +38,7 @@ class TraceEntry(BaseModel):
     """Single entry in the execution trace."""
     type: str = Field(..., description="Type of entry (thought/action/observation/error)")
     content: Any = Field(..., description="Content of the entry")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Timestamp of the entry")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp of the entry")
     step_number: Optional[int] = Field(None, description="Step number in the execution")
     tool_name: Optional[str] = Field(None, description="Tool name if applicable")
     execution_time: Optional[float] = Field(None, description="Execution time in seconds")
@@ -53,8 +53,11 @@ class ChatRequest(BaseModel):
     """Request body for the /chat endpoint."""
     message: str = Field(..., min_length=1, max_length=20_000, description="User message")
     max_steps: int = Field(default=10, ge=1, le=50, description="Maximum number of agent steps")
-    allowed_tools: Optional[list[str]] = Field(None, max_length=20, description="List of allowed tools (empty = all tools)")
+    allowed_tools: Optional[list[str]] = Field(None, max_length=20, description="Requested subset of the server-side tool policy")
     max_token_budget: Optional[int] = Field(None, ge=1, le=2_000_000, description="Maximum token budget for the run")
+    max_tool_calls: int = Field(default=20, ge=0, le=100)
+    max_run_seconds: float = Field(default=120, gt=0, le=600)
+    max_cost_budget: Optional[float] = Field(None, gt=0)
 
 
 class ChatResponse(BaseModel):

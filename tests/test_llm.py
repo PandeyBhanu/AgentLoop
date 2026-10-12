@@ -8,7 +8,16 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from app.llm import LLMClient, LLMConfig, estimate_tokens, extract_json_block
+from app.llm import (
+    GeminiProvider,
+    GroqProvider,
+    LLMClient,
+    LLMConfig,
+    LLMHTTPError,
+    OpenAIProvider,
+    estimate_tokens,
+    extract_json_block,
+)
 from app.schemas.messages import Message
 
 
@@ -67,6 +76,45 @@ class TestOpenAIPath:
         assert meta["provider"] == "openai"
         assert meta["total_tokens"] == 15
 
+    async def test_native_function_call_becomes_agent_action(self, monkeypatch):
+        client = make_client("openai")
+        payload = {"choices": [{"message": {"content": None, "tool_calls": [{
+            "type": "function", "function": {"name": "Calculator", "arguments": '{"operation":"add","a":1,"b":2}'},
+        }]}}]}
+        patch_post(client, monkeypatch, http_response(payload=payload))
+        content, _ = await client.send_messages(MSGS, TOOL_SCHEMAS)
+        assert json.loads(content) == {"type": "action", "tool_name": "Calculator",
+                                       "arguments": {"operation": "add", "a": 1, "b": 2}}
+
+    async def test_native_call_flows_through_agent_loop(self, monkeypatch):
+        from app.agent.loop import AgentLoop
+        from app.tools.registry import ToolRegistry
+        from app.tools.calculator import Calculator
+        client = make_client("openai")
+        action = {"choices": [{"message": {"content": None, "tool_calls": [{
+            "type": "function", "function": {"name": "Calculator", "arguments": '{"operation":"add","a":1,"b":2}'},
+        }]}}]}
+        replies = [http_response(payload=action), http_response(payload={"choices": [{"message": {
+            "content": '{"type":"finish","final_answer":"3"}'
+        }}]})]
+        mock = AsyncMock(side_effect=replies)
+        monkeypatch.setattr(client.client, "post", mock)
+        registry = ToolRegistry()
+        registry.register(Calculator())
+        state = await AgentLoop(client, registry).run("1+2")
+        assert state.final_answer == "3"
+        assert any(entry.type == "observation" for entry in state.trace)
+        assert mock.call_count == 2
+
+    async def test_multiple_native_calls_rejected_explicitly(self, monkeypatch):
+        client = make_client("openai")
+        call = {"type": "function", "function": {"name": "Calculator", "arguments": "{}"}}
+        patch_post(client, monkeypatch, http_response(payload={"choices": [{"message": {
+            "content": None, "tool_calls": [call, call],
+        }}]}))
+        with pytest.raises(ValueError, match="Only one"):
+            await client.send_messages(MSGS, TOOL_SCHEMAS)
+
     async def test_auth_header_sent(self, monkeypatch):
         client = make_client("openai")
         mock = patch_post(client, monkeypatch, http_response(payload=OPENAI_PAYLOAD))
@@ -87,8 +135,28 @@ class TestOpenAIPath:
     async def test_http_error_wrapped(self, monkeypatch):
         client = make_client("openai")
         patch_post(client, monkeypatch, http_response(status=500, payload={}))
-        with pytest.raises(Exception, match="LLM API error"):
+        with pytest.raises(LLMHTTPError, match="LLM API error") as exc:
             await client.send_messages(MSGS)
+        assert exc.value.status_code == 500
+        assert exc.value.transient
+
+    async def test_rate_limit_error_preserves_retry_after(self, monkeypatch):
+        client = make_client("openai")
+        response = http_response(status=429, payload={})
+        response.headers["Retry-After"] = "2.5"
+        patch_post(client, monkeypatch, response)
+        with pytest.raises(LLMHTTPError) as exc:
+            await client.send_messages(MSGS)
+        assert exc.value.transient
+        assert exc.value.retry_after == 2.5
+
+    async def test_client_error_is_not_transient(self, monkeypatch):
+        client = make_client("openai")
+        patch_post(client, monkeypatch, http_response(status=400, payload={}))
+        with pytest.raises(LLMHTTPError) as exc:
+            await client.send_messages(MSGS)
+        assert exc.value.status_code == 400
+        assert not exc.value.transient
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +263,17 @@ class TestHelpers:
 # ---------------------------------------------------------------------------
 
 class TestConfig:
+    def test_provider_adapter_contract(self):
+        openai = make_client("openai")
+        groq = make_client("groq")
+        gemini = make_client("gemini")
+        assert isinstance(openai.provider, OpenAIProvider)
+        assert isinstance(groq.provider, GroqProvider)
+        assert isinstance(gemini.provider, GeminiProvider)
+        assert openai.capabilities == {"native_tool_calls": True, "json_mode": True}
+        assert groq.capabilities == {"native_tool_calls": False, "json_mode": False}
+        assert gemini.capabilities == {"native_tool_calls": False, "json_mode": False}
+
     def test_provider_defaults(self):
         assert LLMConfig(provider="groq", api_key="k").base_url == \
             "https://api.groq.com/openai/v1"

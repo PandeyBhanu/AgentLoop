@@ -2,7 +2,9 @@
 Guardrails for agent execution including loop detection and step limits.
 """
 from typing import Dict, Any, Optional, List
+from collections import deque
 import hashlib
+import json
 from app.utils.hashing import create_fingerprint
 
 
@@ -11,10 +13,19 @@ class Guardrails:
     Implements safety checks for agent execution.
     """
     
-    def __init__(self, max_steps: int = 10, tool_timeout: int = 30, max_thought_history: int = 5):
+    def __init__(
+        self,
+        max_steps: int = 10,
+        tool_timeout: int = 30,
+        max_thought_history: int = 5,
+        action_history_size: int = 12,
+        max_tool_frequency: int = 4,
+    ):
         self.max_steps = max_steps
         self.tool_timeout = tool_timeout
         self.fingerprints: set[str] = set()
+        self.action_signatures: deque[str] = deque(maxlen=action_history_size)
+        self.max_tool_frequency = max_tool_frequency
         self.thought_history: List[str] = []  # Track last N thoughts
         self.max_thought_history = max_thought_history
     
@@ -32,28 +43,62 @@ class Guardrails:
             return False, f"Maximum step limit ({self.max_steps}) reached"
         return True, None
     
+    @staticmethod
+    def _normalized_argument(value: Any, selector: bool = False) -> Any:
+        """Keep stable operation selectors while ignoring changing payload values."""
+        if isinstance(value, dict):
+            return {
+                key: Guardrails._normalized_argument(
+                    item, selector=key.lower() in {"operation", "mode", "type", "action", "command", "method"}
+                )
+                for key, item in sorted(value.items())
+            }
+        if isinstance(value, (list, tuple)):
+            return [Guardrails._normalized_argument(item) for item in value[:8]]
+        if selector and isinstance(value, str) and len(value) <= 64:
+            return value
+        if selector and (isinstance(value, bool) or value is None):
+            return value
+        return type(value).__name__
+
+    def _action_signature(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        normalized = self._normalized_argument(arguments)
+        return f"{tool_name}:{json.dumps(normalized, sort_keys=True, default=str)}"
+
     def check_loop(self, tool_name: str, arguments: Dict[str, Any]) -> tuple[bool, Optional[str]]:
         """
-        Check for loops by fingerprinting tool calls.
-        
+        Check for exact repeats, alternating action cycles, and excessive tool frequency.
+
         Args:
             tool_name: Name of the tool being called
             arguments: Arguments passed to the tool
-            
+
         Returns:
             Tuple of (should_continue, error_message)
         """
         fingerprint = create_fingerprint(tool_name, arguments)
-        
+        signature = self._action_signature(tool_name, arguments)
+
         if fingerprint in self.fingerprints:
             return False, f"Loop detected: tool '{tool_name}' with same arguments called twice"
-        
+
+        history = list(self.action_signatures)
+        if signature and history.count(signature) + 1 > self.max_tool_frequency:
+            return False, f"Loop detected: tool '{tool_name}' invoked too frequently"
+
+        candidate = history + [signature]
+        for period in range(2, min(4, len(candidate) // 2) + 1):
+            if candidate[-period:] == candidate[-2 * period:-period]:
+                return False, f"Loop detected: repeated action sequence of length {period}"
+
         self.fingerprints.add(fingerprint)
+        self.action_signatures.append(signature)
         return True, None
     
     def reset_fingerprints(self) -> None:
-        """Reset the fingerprint tracking."""
+        """Reset the action fingerprint and sequence tracking."""
         self.fingerprints.clear()
+        self.action_signatures.clear()
     
     def add_thought(self, thought: str) -> None:
         """
